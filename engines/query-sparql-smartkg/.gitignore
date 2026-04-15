@@ -1,0 +1,9 @@
+node_modules/
+lib/
+*.js
+*.js.map
+*.d.ts
+.nyc_output/
+coverage/
+engine-*.js
+stats.json

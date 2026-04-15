@@ -1,11 +1,18 @@
 import type { IActorQueryOperationTypedMediatedArgs } from '@comunica/bus-query-operation';
 import { ActorQueryOperationTypedMediated } from '@comunica/bus-query-operation';
 import type { IActorTest, TestResult } from '@comunica/core';
-import { passTestVoid } from '@comunica/core';
+import { ActionContextKey, passTestVoid } from '@comunica/core';
 import type { IActionContext, IQueryOperationResult } from '@comunica/types';
 import type { Algebra } from '@comunica/utils-algebra';
-import { AlgebraFactory } from '@comunica/utils-algebra';
+import { AlgebraFactory, isKnownOperation } from '@comunica/utils-algebra';
 import { termToString } from 'rdf-string';
+
+/**
+ * Context key for SmartKG star pattern candidates that may benefit from SmartKG optimization
+ */
+export const KEY_SMARTKG_CANDIDATES = new ActionContextKey<Algebra.Pattern[][]>(
+  '@comunica/actor-query-operation-bgp-smartkg:candidates',
+);
 
 /**
  * A BGP query operation actor that applies SmartKG optimizations for star patterns.
@@ -33,38 +40,46 @@ export class ActorQueryOperationBgpSmartKg extends ActorQueryOperationTypedMedia
     operation: Algebra.Bgp,
     actionContext: IActionContext,
   ): Promise<IQueryOperationResult> {
-    this.logDebug(actionContext, `BGP SmartKG actor received BGP with ${operation.patterns.length} patterns`);
+    this.logDebug(actionContext, `[SmartKG BGP] Received ${operation.patterns.length} patterns`);
 
     // Decompose BGP into star patterns
     const stars = this.decomposeIntoStars(operation);
-    this.logDebug(actionContext, `Decomposed into ${stars.length} star patterns`);
+    this.logDebug(actionContext, `[SmartKG BGP] Decomposed into ${stars.length} star patterns`);
     
-    // For each star, check if it's a good candidate for SmartKG
-    // In a full implementation, we would:
-    // 1. Fetch metadata from SmartKG endpoints in context
-    // 2. Evaluate each star against family definitions
-    // 3. Route SmartKG candidates with source annotations
-    // 4. Route others to standard BGP handler
-    // For now, apply simple heuristics:
-    //   - Single pattern stars are good candidates (less data movement)
-    //   - Large stars are good candidates (more selectivity benefit)
-    
-    const smallStars = stars.filter(s => s.length === 1);
-    const largeStars = stars.filter(s => s.length >= this.minPatternCount);
-    
-    if (smallStars.length > 0 || largeStars.length > 0) {
+    for (let i = 0; i < stars.length; i++) {
+      const star = stars[i];
       this.logDebug(
         actionContext,
-        `Identified ${smallStars.length} single-pattern stars and ${largeStars.length} large stars for SmartKG`,
+        `[SmartKG BGP] Star ${i + 1}: ${star.length} patterns, subject=${termToString(star[0]?.subject)}, predicates=[${star.map(p => termToString(p.predicate)).join(', ')}]`,
       );
     }
+    
+    // Identify SmartKG candidates using heuristics
+    const smallStars = stars.filter(s => s.length === 1);
+    const largeStars = stars.filter(s => s.length >= this.minPatternCount);
+    const smartkgCandidates = [...smallStars, ...largeStars];
+    
+    if (smartkgCandidates.length > 0) {
+      this.logDebug(
+        actionContext,
+        `[SmartKG BGP] Identified ${smallStars.length} single-pattern stars and ${largeStars.length} large stars`,
+      );
+      
+      // Pass SmartKG candidate hints to downstream operators
+      actionContext = actionContext.set(KEY_SMARTKG_CANDIDATES, smartkgCandidates);
+    }
 
+    this.logDebug(actionContext, `[SmartKG BGP] Delegating to standard BGP handler`);
+    
     // Delegate to standard BGP handler
-    // TODO: Phase 2 complete - Add source annotations for SmartKG routing
-    return this.mediatorQueryOperation.mediate({
+    const result = await this.mediatorQueryOperation.mediate({
       context: actionContext,
       operation,
     });
+
+    this.logDebug(actionContext, `[SmartKG BGP] Received result from mediator: type=${result.type}`);
+    
+    return result;
   }
 
   /**

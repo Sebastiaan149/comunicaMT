@@ -17,8 +17,9 @@ import {
 import type * as RDF from '@rdfjs/types';
 import * as HDT from 'hdt';
 import type { Mediator, Actor, IActorTest } from '@comunica/core';
-import { EmptyIterator, BufferedIterator } from 'asynciterator';
+import { EmptyIterator, BufferedIterator, TransformIterator, UnionIterator, AsyncIterator } from 'asynciterator';
 import { Readable } from 'stream';
+import { termToString } from 'rdf-string';
 const stringifyStream = require('stream-to-string');
 
 /**
@@ -130,7 +131,7 @@ class HdtBindingsIterator extends BufferedIterator<RDF.Bindings> {
       this.close();
       return done();
     }
-
+    
     this.hdtDocument.searchBindings(
       this.bindingsFactory,
       this.subject,
@@ -262,9 +263,14 @@ export class QuerySourceSmartKg implements IQuerySource {
     return new Promise((resolve, reject) => {
       const writeStream = createWriteStream(localPath);
       const buffer = typeof content === 'string' ? Buffer.from(content) : (content as Buffer);
+      writeStream.on('finish', () => {
+        resolve(content);
+      });
+      writeStream.on('error', (err) => {
+        reject(err);
+      });
       writeStream.write(buffer);
-      writeStream.on('finish', () => resolve(content));
-      writeStream.on('error', reject);
+      writeStream.end();
     });
   }
 
@@ -276,7 +282,9 @@ export class QuerySourceSmartKg implements IQuerySource {
       return this.cachedMetadata;
     }
 
-    const metadataUrl = `${this.baseUrl.replace(/\/$/, '')}/molecule/${this.baseUrl.split('/').pop()}`;
+    const baseUrlClean = this.baseUrl.replace(/\/$/, '');
+    const metadataUrl = `${baseUrlClean}/molecule/smartkg`;
+    
     const metadataJson = await this.fetchAndCache(metadataUrl);
     this.cachedMetadata = parseSmartKgMetadata(metadataJson);
     return this.cachedMetadata;
@@ -286,7 +294,7 @@ export class QuerySourceSmartKg implements IQuerySource {
    * Fetch HDT file and return local path
    */
   private async fetchHdtFile(familyName: string): Promise<string> {
-    const hdtUrl = `${this.baseUrl.replace(/\/$/, '')}/molecule/${this.baseUrl.split('/').pop()}/${familyName}`;
+    const hdtUrl = `${this.baseUrl.replace(/\/$/, '')}/molecule/smartkg/${familyName}`;
     const localPath = join(this.cacheFolder, encodeURIComponent(hdtUrl));
 
     if (existsSync(localPath)) {
@@ -344,57 +352,36 @@ export class QuerySourceSmartKg implements IQuerySource {
     }
 
     const pattern = operation as Algebra.Pattern;
+    const self = this;
 
-    // Create async iterator that will be used to stream results
-    let resultIterator: any;
-    
-    // Execute query asynchronously
-    const queryPromise = (async () => {
+    // Create an async function that sets up and returns the source iterator
+    const setupQuery = async function*(): AsyncIterable<RDF.Bindings> {
       try {
         // Fetch metadata to determine which families to query
-        const metadata = await this.fetchMetadata();
-        console.debug(`[SmartKG] Loaded metadata: ${metadata.numFamilies} families available`);
+        const metadata = await self.fetchMetadata();
         
-        // Extract predicates from the pattern
         const predicates = extractPredicates([pattern]);
-        console.debug(`[SmartKG] Query predicates: ${Array.from(predicates).join(', ') || '(no predicates)'}`);
         
-        // Create infrequent set for checking
         const infrequentSet = new Set(metadata.infrequentPredicates);
         
-        // Check if pattern uses infrequent predicates (should use fallback TPF)
         if (hasInfrequentPredicate([pattern], infrequentSet)) {
-          // This pattern uses infrequent predicates - no matching partitions
-          console.debug(`[SmartKG] Pattern uses infrequent predicates, falling back to TPF`);
-          resultIterator.end();
           return;
         }
         
-        // Find families that contain all query predicates
         const matchingFamilies = findMatchingFamilies(predicates, metadata.families, infrequentSet);
-        console.debug(`[SmartKG] Found ${matchingFamilies.length} matching families for predicates`);
         
         if (matchingFamilies.length === 0) {
-          // No matching families, cannot handle with SmartKG partitions
-          console.debug(`[SmartKG] No matching families found, cannot process query`);
-          resultIterator.end();
           return;
         }
         
-        // Select optimal families (with grouping optimization)
         const optimalFamilies = selectOptimalFamilies(matchingFamilies);
-        console.debug(`[SmartKG] Selected ${optimalFamilies.length} optimal families`);
         
-        // Collect iterators from all optimal families
         const familyIterators: BindingsStream[] = [];
         
         for (const optimizedFamily of optimalFamilies) {
-          // Fetch the HDT file for this family
-          const hdtPath = await this.fetchHdtFile(optimizedFamily.name);
-          console.debug(`[SmartKG] Fetched HDT partition: ${optimizedFamily.name} (${optimizedFamily.numTriples} triples)`);
+          const hdtPath = await self.fetchHdtFile(optimizedFamily.name);
           
-          // Query the HDT partition
-          const iter = await this.queryHdtPartition(
+          const iter = await self.queryHdtPartition(
             hdtPath,
             pattern.subject,
             pattern.predicate,
@@ -404,60 +391,71 @@ export class QuerySourceSmartKg implements IQuerySource {
           familyIterators.push(iter);
         }
         
-        // If we have results, use union iterator; otherwise end
         if (familyIterators.length === 0) {
-          console.debug(`[SmartKG] No family iterators created`);
-          resultIterator.end();
           return;
         }
 
-        if (familyIterators.length === 1) {
-          // Single family - just use its iterator directly
-          console.debug(`[SmartKG] Using single family iterator`);
-          const singleIter = familyIterators[0];
-          singleIter.on('data', (binding: RDF.Bindings) => resultIterator.push(binding));
-          singleIter.on('end', () => resultIterator.end());
-          singleIter.on('error', (error: Error) => resultIterator.destroy(error));
-        } else {
-          // Multiple families - union them
-          console.debug(`[SmartKG] Unioning ${familyIterators.length} family iterators`);
-          let completed = 0;
-          const totalIterators = familyIterators.length;
-
-          for (const iter of familyIterators) {
-            iter.on('data', (binding: RDF.Bindings) => {
-              resultIterator.push(binding);
-            });
-            
-            iter.on('end', () => {
-              completed++;
-              if (completed === totalIterators) {
-                console.debug(`[SmartKG] All family iterators completed`);
-                resultIterator.end();
-              }
-            });
-            
-            iter.on('error', (error: Error) => {
-              console.error(`[SmartKG] Error in family iterator:`, error);
-              resultIterator.destroy(error);
-            });
-          }
+        const sourceIterator = familyIterators.length === 1
+          ? familyIterators[0]
+          : new UnionIterator<RDF.Bindings>(familyIterators);
+        
+        // Yield all bindings from the source iterator
+        for await (const binding of sourceIterator) {
+          yield binding;
         }
       } catch (error) {
-        console.error(`[SmartKG] Error during query execution:`, error);
-        resultIterator.destroy(error as Error);
+        throw error;
       }
-    })();
+    };
 
-    // Create the output iterator that will be returned
-    resultIterator = new (require('asynciterator') as any).AsyncIterator({ autoStart: false });
-    
-    // Start query processing
-    queryPromise.catch((error: Error) => {
-      resultIterator.destroy(error);
-    });
-    
-    return resultIterator as BindingsStream;
+    // Convert async iterable to a stream by properly implementing _read
+    class SmartKgAsyncIteratorAdapter extends BufferedIterator<RDF.Bindings> {
+      private readonly asyncIterable: AsyncIterable<RDF.Bindings>;
+      private hasSetMetadata = false;
+
+      public constructor(asyncIterable: AsyncIterable<RDF.Bindings>) {
+        super({ autoStart: true, maxBufferSize: 1000 });
+        this.asyncIterable = asyncIterable;
+        this.startIteration();
+      }
+
+      private async startIteration(): Promise<void> {
+        try {
+          // Collect first binding to extract metadata
+          let firstBinding: RDF.Bindings | undefined;
+          for await (const binding of this.asyncIterable) {
+            if (!this.hasSetMetadata && !firstBinding) {
+              firstBinding = binding;
+              // Set metadata based on the first binding's variables
+              const variables: any[] = [];
+              for (const key of binding.keys()) {
+                variables.push({ variable: key, canBeUndef: false });
+              }
+              this.setProperty('metadata', {
+                state: { valid: true },
+                cardinality: { type: 'estimate', value: 100000 },
+                variables,
+              });
+              this.hasSetMetadata = true;
+            }
+            this._push(binding);
+          }
+          this.close();
+        } catch (error) {
+          this.destroy(error as Error);
+        }
+      }
+
+      public override _read(count: number, done: () => void): void {
+        done();
+      }
+    }
+
+    return new SmartKgAsyncIteratorAdapter(setupQuery()) as BindingsStream;
+  }
+
+  public toString(): string {
+    return 'QuerySourceSmartKg';
   }
 
   public queryQuads(

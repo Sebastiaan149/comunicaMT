@@ -184,3 +184,118 @@ export function isStarPatternSmartKg(
   const matching = findMatchingFamilies(predicates, metadata.families, infrequentSet);
   return matching.length > 0;
 }
+
+/**
+ * Extract Smart-KG shipping strategy hints from query operation metadata
+ * 
+ * @param context - The execution context that may contain optimization metadata
+ * @param pattern - The current pattern being evaluated
+ * @returns The recommended shipping strategy ('P-S' or 'TP-S') or undefined if not determined
+ */
+export function getShippingStrategyHint(
+  context: any,
+  pattern: Algebra.Pattern,
+): 'P-S' | 'TP-S' | undefined {
+  try {
+    // Check if context has Smart-KG optimization metadata
+    if (context && context.smartkgStars && Array.isArray(context.smartkgStars)) {
+      const subjectStr = termToString(pattern.subject);
+      
+      // Find the star that contains this pattern's subject
+      for (const star of context.smartkgStars) {
+        if (star.subject === subjectStr) {
+          return star.strategy;
+        }
+      }
+    }
+  } catch (_err) {
+    // Silently ignore errors, will fall back to default behavior
+  }
+  
+  return undefined;
+}
+
+/**
+ * Check if a pattern is part of a multi-pattern star (eligible for P-S)
+ * based on optimization metadata
+ * 
+ * @param context - The execution context
+ * @param pattern - The current pattern
+ * @returns The number of patterns in this star, or 0 if not determined
+ */
+export function getStarPatternCount(
+  context: any,
+  pattern: Algebra.Pattern,
+): number {
+  try {
+    if (context && context.smartkgStars && Array.isArray(context.smartkgStars)) {
+      const subjectStr = termToString(pattern.subject);
+      
+      for (const star of context.smartkgStars) {
+        if (star.subject === subjectStr) {
+          return star.patternCount;
+        }
+      }
+    }
+  } catch (_err) {
+    // Silently ignore
+  }
+  
+  return 0;
+}
+
+/**
+ * Detect the number of patterns with the same subject in a join operation
+ * Recursively extracts patterns from the operation tree
+ * 
+ * @param operation - The operation to analyze
+ * @param targetSubject - The subject term to match
+ * @returns The count of patterns with matching subject
+ */
+export function detectStarPatternCount(
+  operation: Algebra.Operation | undefined,
+  targetSubject: RDF.Term,
+): number {
+  if (!operation) {
+    return 0;
+  }
+
+  const patterns: Algebra.Pattern[] = [];
+  collectPatternsRecursive(operation, patterns);
+
+  const targetSubjectStr = termToString(targetSubject);
+  let count = 0;
+  for (const pattern of patterns) {
+    if (termToString(pattern.subject) === targetSubjectStr) {
+      count++;
+    }
+  }
+
+  return count;
+}
+
+/**
+ * Recursively collect all patterns from an operation tree
+ */
+function collectPatternsRecursive(
+  operation: Algebra.Operation,
+  patterns: Algebra.Pattern[],
+): void {
+  if (operation.type === 'pattern') {
+    patterns.push(operation as Algebra.Pattern);
+  } else if (operation.type === 'join') {
+    const join = operation as Algebra.Join;
+    for (const input of join.input) {
+      collectPatternsRecursive(input, patterns);
+    }
+  } else if ('input' in operation && operation.input) {
+    const input = (operation as any).input;
+    if (Array.isArray(input)) {
+      for (const op of input) {
+        collectPatternsRecursive(op, patterns);
+      }
+    } else if (input && typeof input === 'object') {
+      collectPatternsRecursive(input as Algebra.Operation, patterns);
+    }
+  }
+}

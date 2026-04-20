@@ -74,6 +74,7 @@
     "@comunica/actor-optimize-query-operation-filter-pushdown": "^5.1.3",
     "@comunica/actor-optimize-query-operation-join-connected": "^5.1.3",
     "@comunica/actor-optimize-query-operation-query-source-identify": "^5.1.3",
+    "@comunica/actor-optimize-query-operation-smartkg-ship": "^5.1.3",
     "@comunica/actor-query-operation-ask": "^5.1.3",
     "@comunica/actor-query-operation-construct": "^5.1.3",
     "@comunica/actor-query-operation-distinct-identity": "^5.1.3",

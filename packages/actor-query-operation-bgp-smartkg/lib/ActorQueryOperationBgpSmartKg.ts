@@ -1,22 +1,23 @@
 import type { IActorQueryOperationTypedMediatedArgs } from '@comunica/bus-query-operation';
 import { ActorQueryOperationTypedMediated } from '@comunica/bus-query-operation';
 import type { IActorTest, TestResult } from '@comunica/core';
-import { ActionContextKey, passTestVoid } from '@comunica/core';
+import { failTest, passTestVoid } from '@comunica/core';
 import type { IActionContext, IQueryOperationResult } from '@comunica/types';
 import type { Algebra } from '@comunica/utils-algebra';
-import { AlgebraFactory, isKnownOperation } from '@comunica/utils-algebra';
 import { termToString } from 'rdf-string';
 
-/**
- * Context key for SmartKG star pattern candidates that may benefit from SmartKG optimization
- */
-export const KEY_SMARTKG_CANDIDATES = new ActionContextKey<Algebra.Pattern[][]>(
-  '@comunica/actor-query-operation-bgp-smartkg:candidates',
-);
+type SmartKgShippingStrategy = 'P-S' | 'TP-S';
+
+interface ISmartKgStarHint {
+  subject: string;
+  patternCount: number;
+  strategy: SmartKgShippingStrategy;
+}
 
 /**
- * A BGP query operation actor that applies SmartKG optimizations for star patterns.
- * Decomposes BGPs into star patterns and routes them to SmartKG or falls back to standard BGP handling.
+ * BGP actor that detects subject-based stars inside a BGP and stores
+ * SmartKG shipping hints in the context before delegating to the normal
+ * query-operation mediator.
  */
 export class ActorQueryOperationBgpSmartKg extends ActorQueryOperationTypedMediated<Algebra.Bgp> {
   public readonly maxFamilies: number;
@@ -29,87 +30,71 @@ export class ActorQueryOperationBgpSmartKg extends ActorQueryOperationTypedMedia
   }
 
   public async testOperation(
-    operation: Algebra.Bgp,
-    _actionContext: IActionContext,
+    _operation: Algebra.Bgp,
+    context: IActionContext,
   ): Promise<TestResult<IActorTest>> {
-    // Pass through - this actor doesn't reject, just decomposes and analyzes
+    if (isContextFlagSet(context, 'smartkgBgpHandled')) {
+      return failTest(`Actor ${this.name} skips already handled SmartKG BGP operations.`);
+    }
     return passTestVoid();
   }
 
   public async runOperation(
     operation: Algebra.Bgp,
-    actionContext: IActionContext,
+    context: IActionContext,
   ): Promise<IQueryOperationResult> {
-    this.logDebug(actionContext, `[SmartKG BGP] Received ${operation.patterns.length} patterns`);
+    const stars = toStarHints(operation);
+    let nextContext = context;
 
-    // Decompose BGP into star patterns
-    const stars = this.decomposeIntoStars(operation);
-    this.logDebug(actionContext, `[SmartKG BGP] Decomposed into ${stars.length} star patterns`);
-    
-    for (let i = 0; i < stars.length; i++) {
-      const star = stars[i];
-      this.logDebug(
-        actionContext,
-        `[SmartKG BGP] Star ${i + 1}: ${star.length} patterns, subject=${termToString(star[0]?.subject)}, predicates=[${star.map(p => termToString(p.predicate)).join(', ')}]`,
-      );
-    }
-    
-    // Identify SmartKG candidates using heuristics
-    const smallStars = stars.filter(s => s.length === 1);
-    const largeStars = stars.filter(s => s.length >= this.minPatternCount);
-    const smartkgCandidates = [...smallStars, ...largeStars];
-    
-    if (smartkgCandidates.length > 0) {
-      this.logDebug(
-        actionContext,
-        `[SmartKG BGP] Identified ${smallStars.length} single-pattern stars and ${largeStars.length} large stars`,
-      );
-      
-      // Pass SmartKG candidate hints to downstream operators
-      actionContext = actionContext.set(KEY_SMARTKG_CANDIDATES, smartkgCandidates);
+    if (typeof (nextContext as any).setRaw === 'function') {
+      nextContext = (nextContext as any).setRaw('smartkgStars', stars);
+      nextContext = (nextContext as any).setRaw('smartkgBgpHandled', true);
     }
 
-    this.logDebug(actionContext, `[SmartKG BGP] Delegating to standard BGP handler`);
-    
-    // Delegate to standard BGP handler
-    const result = await this.mediatorQueryOperation.mediate({
-      context: actionContext,
+    return this.mediatorQueryOperation.mediate({
       operation,
+      context: nextContext,
     });
-
-    this.logDebug(actionContext, `[SmartKG BGP] Received result from mediator: type=${result.type}`);
-    
-    return result;
-  }
-
-  /**
-   * Decompose a BGP into star patterns (patterns grouped by subject)
-   */
-  private decomposeIntoStars(bgp: Algebra.Bgp): Algebra.Pattern[][] {
-    const starMap: Map<string, Algebra.Pattern[]> = new Map();
-
-    for (const pattern of bgp.patterns) {
-      const subjectKey = termToString(pattern.subject);
-      if (!starMap.has(subjectKey)) {
-        starMap.set(subjectKey, []);
-      }
-      starMap.get(subjectKey)!.push(pattern);
-    }
-
-    return Array.from(starMap.values());
   }
 }
 
-export interface IActorQueryOperationBgpSmartKgArgs extends IActorQueryOperationTypedMediatedArgs {
-  /**
-   * Maximum number of families to fetch before delegating to standard BGP handler
-   * @default {100}
-   */
-  maxFamilies?: number;
+function toStarHints(operation: Algebra.Bgp): ISmartKgStarHint[] {
+  const stars = new Map<string, Algebra.Pattern[]>();
 
-  /**
-   * Minimum number of patterns in a star for SmartKG to be beneficial
-   * @default {2}
-   */
+  for (const pattern of operation.patterns) {
+    const subject = termToString(pattern.subject);
+    const bucket = stars.get(subject) ?? [];
+    bucket.push(pattern);
+    stars.set(subject, bucket);
+  }
+
+  return [ ...stars.entries() ].map(([ subject, patterns ]) => ({
+    subject,
+    patternCount: patterns.length,
+    strategy:
+      patterns.length >= 2 &&
+      patterns.every(pattern => pattern.predicate.termType !== 'Variable')
+        ? 'P-S'
+        : 'TP-S',
+  }));
+}
+
+function isContextFlagSet(context: unknown, key: string): boolean {
+  if (!context) {
+    return false;
+  }
+
+  const rawValue = typeof (context as any).getRaw === 'function' ?
+    (context as any).getRaw(key) :
+    undefined;
+  if (rawValue !== undefined) {
+    return Boolean(rawValue);
+  }
+
+  return Boolean((context as Record<string, unknown>)[key]);
+}
+
+export interface IActorQueryOperationBgpSmartKgArgs extends IActorQueryOperationTypedMediatedArgs {
+  maxFamilies?: number;
   minPatternCount?: number;
 }

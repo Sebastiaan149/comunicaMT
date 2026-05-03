@@ -10,7 +10,7 @@
       "@id": "urn:comunica:default:query-source-identify-hypermedia/actors#smartkg",
       "@type": "ActorQuerySourceIdentifyHypermediaSmartKg",
       "mediatorHttp": { "@id": "urn:comunica:default:http/mediators#main" },
-      "mediatorMergeBindingsContext": { "@id": "urn:comunica:default:merge-bindings-context/mediators#main" }
+      "mediatorQuerySourceDereferenceLink": { "@id": "urn:comunica:default:query-source-dereference-link/mediators#main" }
     }
   ]
 }

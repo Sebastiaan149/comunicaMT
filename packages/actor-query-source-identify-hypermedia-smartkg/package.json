@@ -42,6 +42,7 @@
   },
   "dependencies": {
     "@comunica/bus-http": "^5.1.3",
+    "@comunica/bus-query-source-dereference-link": "^5.1.3",
     "@comunica/bus-query-source-identify": "^5.1.3",
     "@comunica/bus-query-source-identify-hypermedia": "^5.1.3",
     "@comunica/context-entries": "^5.1.3",

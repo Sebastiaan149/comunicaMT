@@ -4,6 +4,7 @@
   ],
   "import": [
     "ccqs:config/config-default-v5-1-3.json",
+    "optimize-query-operation/actors-smartkg-ship.json",
     "query-source-identify-hypermedia/actors-smartkg.json"
   ]
 }

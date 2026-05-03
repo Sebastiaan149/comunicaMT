@@ -2,34 +2,34 @@ import type { Algebra } from '@comunica/utils-algebra';
 import { termToString } from 'rdf-string';
 import type * as RDF from '@rdfjs/types';
 
-/**
- * Represents a family from SmartKG metadata
- */
 export interface ISmartKgFamily {
   index: number;
   name: string;
   numSubjects: number;
   numTriples: number;
-  grouped: boolean;
+  grouped?: boolean;
   predicateSet: string[];
+  sourceSet?: number[];
+  originalFamily?: number;
+  noMaterialized?: boolean;
 }
 
-/**
- * Represents parsed SmartKG metadata
- */
 export interface ISmartKgMetadata {
   numFamilies: number;
   infrequentPredicates: string[];
+  massivePredicates?: string[];
   families: ISmartKgFamily[];
 }
 
-/**
- * Extract all predicates from a pattern or star pattern
- */
+export interface ISmartKgStarHint {
+  subject: string;
+  patternCount: number;
+  strategy: 'P-S' | 'TP-S';
+}
+
 export function extractPredicates(patterns: Algebra.Pattern[]): Set<string> {
   const predicates = new Set<string>();
   for (const pattern of patterns) {
-    // Skip variable predicates
     if (pattern.predicate.termType !== 'Variable') {
       predicates.add(termToString(pattern.predicate));
     }
@@ -37,221 +37,236 @@ export function extractPredicates(patterns: Algebra.Pattern[]): Set<string> {
   return predicates;
 }
 
-/**
- * Check if any predicate is in the infrequent list
- */
-export function hasInfrequentPredicate(patterns: Algebra.Pattern[], infrequentPredicates: Set<string>): boolean {
+export function hasInfrequentPredicate(patterns: Algebra.Pattern[], blockedPredicates: Set<string>): boolean {
   for (const pattern of patterns) {
-    if (pattern.predicate.termType !== 'Variable') {
-      const predicateStr = termToString(pattern.predicate);
-      if (infrequentPredicates.has(predicateStr)) {
-        return true;
-      }
+    if (pattern.predicate.termType !== 'Variable' && blockedPredicates.has(termToString(pattern.predicate))) {
+      return true;
     }
   }
   return false;
 }
 
-/**
- * Find matching families for the given predicates
- * Returns families where all query predicates are in the family's predicate set
- */
+export function hasBlockedPredicate(patterns: Algebra.Pattern[], blockedPredicates: Set<string>): boolean {
+  return hasInfrequentPredicate(patterns, blockedPredicates);
+}
+
 export function findMatchingFamilies(
   queryPredicates: Set<string>,
   families: ISmartKgFamily[],
-  infrequentPredicates: Set<string>,
+  _blockedPredicates?: Set<string>,
 ): ISmartKgFamily[] {
-  const matching: ISmartKgFamily[] = [];
+  if (queryPredicates.size === 0) {
+    return [];
+  }
 
+  const matching: ISmartKgFamily[] = [];
   for (const family of families) {
-    // Skip families with 0 triples
-    if (family.numTriples === 0) {
+    if (!family.predicateSet || family.predicateSet.length === 0) {
       continue;
     }
-
-    // Check if all query predicates are in this family
     const familyPredicateSet = new Set(family.predicateSet);
     let allMatch = true;
-    for (const pred of queryPredicates) {
-      if (!familyPredicateSet.has(pred)) {
+    for (const predicate of queryPredicates) {
+      if (!familyPredicateSet.has(predicate)) {
         allMatch = false;
         break;
       }
     }
-
     if (allMatch) {
       matching.push(family);
     }
   }
-
   return matching;
 }
 
-/**
- * Apply grouping optimization: prefer grouped families (merged sets) over individual ones.
- * Returns the minimal set of families needed to cover all predicates.
- */
+export function resolveFamiliesToMaterialized(
+  families: ISmartKgFamily[],
+  metadata: ISmartKgMetadata,
+): ISmartKgFamily[] {
+  const byIndex = new Map<number, ISmartKgFamily>();
+  for (const family of metadata.families) {
+    byIndex.set(family.index, family);
+  }
+
+  const resolved = new Map<number, ISmartKgFamily>();
+  const visiting = new Set<number>();
+  const visit = (family: ISmartKgFamily): void => {
+    if (resolved.has(family.index)) {
+      return;
+    }
+    if (visiting.has(family.index)) {
+      return;
+    }
+
+    visiting.add(family.index);
+    if (Array.isArray(family.sourceSet) && family.sourceSet.length > 0) {
+      for (const index of family.sourceSet) {
+        const sourceFamily = byIndex.get(index);
+        if (sourceFamily) {
+          visit(sourceFamily);
+        }
+      }
+      visiting.delete(family.index);
+      return;
+    }
+
+    const isMaterialized = !family.noMaterialized && family.numTriples > 0 && Boolean(family.name);
+    if (isMaterialized) {
+      resolved.set(family.index, family);
+      visiting.delete(family.index);
+      return;
+    }
+
+    if (typeof family.originalFamily === 'number') {
+      const original = byIndex.get(family.originalFamily);
+      if (original) {
+        visit(original);
+      }
+    }
+    visiting.delete(family.index);
+  };
+
+  for (const family of families) {
+    visit(family);
+  }
+
+  return [ ...resolved.values() ];
+}
+
+interface ISelectOptimalFamiliesOptions {
+  preferGrouped?: boolean;
+  maxFamilies?: number;
+  resolveMaterialized?: boolean;
+  completeCoverage?: boolean;
+}
+
 export function selectOptimalFamilies(
   matchingFamilies: ISmartKgFamily[],
-  options: {
-    preferGrouped?: boolean;
-    maxFamilies?: number;
-  } = {},
+  metadataOrOptions?: ISmartKgMetadata | ISelectOptimalFamiliesOptions,
+  maybeOptions?: ISelectOptimalFamiliesOptions,
 ): ISmartKgFamily[] {
-  const { preferGrouped = true, maxFamilies = 100 } = options;
+  let metadata: ISmartKgMetadata | undefined;
+  let options: ISelectOptimalFamiliesOptions | undefined;
+
+  if (metadataOrOptions && 'families' in metadataOrOptions) {
+    metadata = metadataOrOptions;
+    options = maybeOptions;
+  } else {
+    options = metadataOrOptions as ISelectOptimalFamiliesOptions | undefined;
+  }
+
+  const preferGrouped = options?.preferGrouped ?? true;
+  const maxFamilies = options?.maxFamilies ?? 100;
+  const resolveMaterialized = options?.resolveMaterialized ?? true;
+  const completeCoverage = options?.completeCoverage ?? false;
 
   if (matchingFamilies.length === 0) {
     return [];
   }
 
-  // Optimization 1: If we have grouped families, prefer those
-  if (preferGrouped) {
-    const groupedFamilies = matchingFamilies.filter(f => f.grouped);
-    if (groupedFamilies.length > 0) {
-      // Among grouped families, select those with smallest predicate sets (fewest extra predicates)
-      const sorted = groupedFamilies.sort((a, b) => a.predicateSet.length - b.predicateSet.length);
-      // Return only the smallest ones (with minimum predicate set size)
-      const minSize = sorted[0].predicateSet.length;
-      const optimal = sorted.filter(f => f.predicateSet.length === minSize);
-      return optimal.slice(0, maxFamilies);
+  let candidates = [ ...matchingFamilies ];
+
+  if (preferGrouped && !completeCoverage) {
+    const grouped = candidates.filter(family => Boolean(family.grouped));
+    if (grouped.length > 0) {
+      candidates = grouped;
     }
   }
 
-  // Optimization 2: If too many families, filter by size
-  if (matchingFamilies.length > maxFamilies) {
-    const sorted = matchingFamilies.sort((a, b) => a.predicateSet.length - b.predicateSet.length);
-    return sorted.slice(0, maxFamilies);
+  candidates.sort((left, right) => {
+    const leftSize = left.predicateSet?.length ?? Number.MAX_SAFE_INTEGER;
+    const rightSize = right.predicateSet?.length ?? Number.MAX_SAFE_INTEGER;
+    if (leftSize !== rightSize) {
+      return leftSize - rightSize;
+    }
+    return left.index - right.index;
+  });
+
+  if (!completeCoverage) {
+    const smallestPredicateSetSize = candidates[0].predicateSet?.length ?? 0;
+    candidates = candidates.filter(family => (family.predicateSet?.length ?? 0) === smallestPredicateSetSize);
   }
 
-  return matchingFamilies;
+  if (metadata && resolveMaterialized) {
+    candidates = resolveFamiliesToMaterialized(candidates, metadata);
+  }
+
+  return candidates.slice(0, maxFamilies);
 }
 
-/**
- * Parse SmartKG metadata from JSON string
- */
 export function parseSmartKgMetadata(jsonStr: string): ISmartKgMetadata {
-  const raw = JSON.parse(jsonStr);
+  const raw = JSON.parse(jsonStr) as Record<string, any>;
+  const familiesRaw = Array.isArray(raw.families) ? raw.families : [];
   return {
-    numFamilies: raw.numFamilies || 0,
-    infrequentPredicates: raw.infrequentPredicates || [],
-    families: (raw.families || []).map((f: any) => ({
-      index: f.index,
-      name: f.name,
-      numSubjects: f.numSubjects,
-      numTriples: f.numTriples,
-      grouped: f.grouped || false,
-      predicateSet: f.predicateSet || [],
+    numFamilies: typeof raw.numFamilies === 'number' ? raw.numFamilies : familiesRaw.length,
+    infrequentPredicates: Array.isArray(raw.infrequentPredicates) ? raw.infrequentPredicates : [],
+    massivePredicates: Array.isArray(raw.massivePredicates) ? raw.massivePredicates : [],
+    families: familiesRaw.map((family: Record<string, any>) => ({
+      index: typeof family.index === 'number' ? family.index : 0,
+      name: typeof family.name === 'string' ? family.name : '',
+      numSubjects: typeof family.numSubjects === 'number' ? family.numSubjects : 0,
+      numTriples: typeof family.numTriples === 'number' ? family.numTriples : 0,
+      grouped: Boolean(family.grouped),
+      predicateSet: Array.isArray(family.predicateSet) ? family.predicateSet : [],
+      sourceSet: Array.isArray(family.sourceSet) ? family.sourceSet.filter((value: unknown) => typeof value === 'number') : undefined,
+      originalFamily: typeof family.originalFamily === 'number' ? family.originalFamily : undefined,
+      noMaterialized: Boolean(family.noMaterialized),
     })),
   };
 }
 
-/**
- * Convert metadata predicates list to Set for faster lookup
- */
 export function metadataToSets(metadata: ISmartKgMetadata): {
   infrequentPredicates: Set<string>;
+  massivePredicates: Set<string>;
+  blockedPredicates: Set<string>;
 } {
-  return {
-    infrequentPredicates: new Set(metadata.infrequentPredicates),
-  };
+  const infrequentPredicates = new Set(metadata.infrequentPredicates);
+  const massivePredicates = new Set(metadata.massivePredicates ?? []);
+  const blockedPredicates = new Set<string>([ ...infrequentPredicates, ...massivePredicates ]);
+  return { infrequentPredicates, massivePredicates, blockedPredicates };
 }
 
-/**
- * Determine if a star pattern should be handled by SmartKG
- */
 export function isStarPatternSmartKg(
   patterns: Algebra.Pattern[],
   metadata: ISmartKgMetadata,
-  minPatternsForSmartKg: number = 2,
+  minPatternsForSmartKg = 2,
 ): boolean {
-  // SmartKG only beneficial for multi-pattern stars
   if (patterns.length < minPatternsForSmartKg) {
     return false;
   }
 
-  // Check for variable or infrequent predicates
-  const infrequentSet = new Set(metadata.infrequentPredicates);
-  if (hasInfrequentPredicate(patterns, infrequentSet)) {
+  if (patterns.some(pattern => pattern.predicate.termType === 'Variable')) {
     return false;
   }
 
-  // Check if we can find matching families
+  const { blockedPredicates } = metadataToSets(metadata);
+  if (hasBlockedPredicate(patterns, blockedPredicates)) {
+    return false;
+  }
+
   const predicates = extractPredicates(patterns);
-  if (predicates.size === 0) {
-    return false;
-  }
-
-  const matching = findMatchingFamilies(predicates, metadata.families, infrequentSet);
-  return matching.length > 0;
+  return findMatchingFamilies(predicates, metadata.families).length > 0;
 }
 
-/**
- * Extract Smart-KG shipping strategy hints from query operation metadata
- * 
- * @param context - The execution context that may contain optimization metadata
- * @param pattern - The current pattern being evaluated
- * @returns The recommended shipping strategy ('P-S' or 'TP-S') or undefined if not determined
- */
 export function getShippingStrategyHint(
   context: any,
   pattern: Algebra.Pattern,
 ): 'P-S' | 'TP-S' | undefined {
-  try {
-    // Check if context has Smart-KG optimization metadata
-    if (context && context.smartkgStars && Array.isArray(context.smartkgStars)) {
-      const subjectStr = termToString(pattern.subject);
-      
-      // Find the star that contains this pattern's subject
-      for (const star of context.smartkgStars) {
-        if (star.subject === subjectStr) {
-          return star.strategy;
-        }
-      }
-    }
-  } catch (_err) {
-    // Silently ignore errors, will fall back to default behavior
-  }
-  
-  return undefined;
+  const stars = getSmartKgStars(context);
+  const subject = termToString(pattern.subject);
+  const star = stars.find(entry => entry.subject === subject);
+  return star?.strategy;
 }
 
-/**
- * Check if a pattern is part of a multi-pattern star (eligible for P-S)
- * based on optimization metadata
- * 
- * @param context - The execution context
- * @param pattern - The current pattern
- * @returns The number of patterns in this star, or 0 if not determined
- */
 export function getStarPatternCount(
   context: any,
   pattern: Algebra.Pattern,
 ): number {
-  try {
-    if (context && context.smartkgStars && Array.isArray(context.smartkgStars)) {
-      const subjectStr = termToString(pattern.subject);
-      
-      for (const star of context.smartkgStars) {
-        if (star.subject === subjectStr) {
-          return star.patternCount;
-        }
-      }
-    }
-  } catch (_err) {
-    // Silently ignore
-  }
-  
-  return 0;
+  const stars = getSmartKgStars(context);
+  const subject = termToString(pattern.subject);
+  return stars.find(entry => entry.subject === subject)?.patternCount ?? 0;
 }
 
-/**
- * Detect the number of patterns with the same subject in a join operation
- * Recursively extracts patterns from the operation tree
- * 
- * @param operation - The operation to analyze
- * @param targetSubject - The subject term to match
- * @returns The count of patterns with matching subject
- */
 export function detectStarPatternCount(
   operation: Algebra.Operation | undefined,
   targetSubject: RDF.Term,
@@ -262,40 +277,46 @@ export function detectStarPatternCount(
 
   const patterns: Algebra.Pattern[] = [];
   collectPatternsRecursive(operation, patterns);
-
   const targetSubjectStr = termToString(targetSubject);
-  let count = 0;
-  for (const pattern of patterns) {
-    if (termToString(pattern.subject) === targetSubjectStr) {
-      count++;
-    }
-  }
-
-  return count;
+  return patterns.filter(pattern => termToString(pattern.subject) === targetSubjectStr).length;
 }
 
-/**
- * Recursively collect all patterns from an operation tree
- */
-function collectPatternsRecursive(
+export function collectPatternsRecursive(
   operation: Algebra.Operation,
   patterns: Algebra.Pattern[],
 ): void {
   if (operation.type === 'pattern') {
     patterns.push(operation as Algebra.Pattern);
-  } else if (operation.type === 'join') {
-    const join = operation as Algebra.Join;
-    for (const input of join.input) {
-      collectPatternsRecursive(input, patterns);
-    }
-  } else if ('input' in operation && operation.input) {
+    return;
+  }
+
+  if ('input' in operation && (operation as any).input) {
     const input = (operation as any).input;
     if (Array.isArray(input)) {
-      for (const op of input) {
-        collectPatternsRecursive(op, patterns);
+      for (const child of input) {
+        collectPatternsRecursive(child as Algebra.Operation, patterns);
       }
-    } else if (input && typeof input === 'object') {
+    } else if (typeof input === 'object') {
       collectPatternsRecursive(input as Algebra.Operation, patterns);
     }
   }
+}
+
+function getSmartKgStars(context: any): ISmartKgStarHint[] {
+  if (!context) {
+    return [];
+  }
+
+  if (Array.isArray(context.smartkgStars)) {
+    return context.smartkgStars as ISmartKgStarHint[];
+  }
+
+  if (typeof context.getRaw === 'function') {
+    const raw = context.getRaw('smartkgStars');
+    if (Array.isArray(raw)) {
+      return raw as ISmartKgStarHint[];
+    }
+  }
+
+  return [];
 }

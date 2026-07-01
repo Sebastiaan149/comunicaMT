@@ -1,4 +1,4 @@
-import { createWriteStream, existsSync, mkdirSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { IActionHttp, IActorHttpOutput } from '@comunica/bus-http';
 import { ActorHttp } from '@comunica/bus-http';
@@ -482,13 +482,13 @@ export class QuerySourceWiseKg implements IQuerySource {
   }
 
   private isOriginalSourceControl(control: string): boolean {
-    return control === 'wisekg' || normalizeUrl(control) === this.originalSourceUrl;
+    return control === 'wisekg' || control === 'smartkg+' || normalizeUrl(control) === this.originalSourceUrl;
   }
 
   private async fetchPartitionFileByControl(control: string): Promise<string> {
     const partitionUrl = this.getPartitionHdtUrlForControl(control);
     const partitionPath = join(this.cacheFolder, encodeURIComponent(partitionUrl));
-    if (existsSync(partitionPath)) {
+    if (existsSync(partitionPath) && isHdtBuffer(readFileSync(partitionPath))) {
       return partitionPath;
     }
 
@@ -497,14 +497,29 @@ export class QuerySourceWiseKg implements IQuerySource {
       throw new Error(`WiseKG partition download failed with HTTP ${response.status}: ${partitionUrl}`);
     }
     const body = ActorHttp.toNodeReadable(response.body);
-    await new Promise<void>((resolve, reject) => {
-      const output = createWriteStream(partitionPath);
-      body.pipe(output);
-      output.on('finish', () => resolve());
-      output.on('error', reject);
-      body.on('error', reject);
-    });
+    const payload = await readStreamToBuffer(body);
+    this.writePartitionPayload(partitionPath, payload);
     return partitionPath;
+  }
+
+  private writePartitionPayload(partitionPath: string, payload: Buffer): void {
+    if (isHdtBuffer(payload)) {
+      writeFileSync(partitionPath, payload);
+      return;
+    }
+
+    const entries = extractTarEntries(payload);
+    const hdtEntry = entries.find(entry => entry.name.endsWith('.hdt') && !entry.name.endsWith('.index.v1-1'));
+    if (!hdtEntry) {
+      writeFileSync(partitionPath, payload);
+      return;
+    }
+
+    writeFileSync(partitionPath, hdtEntry.payload);
+    const indexEntry = entries.find(entry => entry.name === `${hdtEntry.name}.index.v1-1`);
+    if (indexEntry) {
+      writeFileSync(`${partitionPath}.index.v1-1`, indexEntry.payload);
+    }
   }
 
   private getPartitionHdtUrlForControl(control: string): string {
@@ -525,10 +540,23 @@ export class QuerySourceWiseKg implements IQuerySource {
       return control.slice('partition/'.length).replace(/\.hdt$/u, '');
     }
 
+    if (control.startsWith('molecule/')) {
+      return control.split('/').filter(Boolean).pop()?.replace(/\.hdt$/u, '');
+    }
+
+    if (!control.includes('/') && control.endsWith('.hdt')) {
+      return control.replace(/\.hdt$/u, '');
+    }
+
     try {
       const parsed = new URL(control);
       const match = /\/partition\/([^/?#]+)/u.exec(parsed.pathname);
-      return match?.[1]?.replace(/\.hdt$/u, '');
+      const partitionId = match?.[1]?.replace(/\.hdt$/u, '');
+      if (partitionId) {
+        return partitionId;
+      }
+      const moleculeMatch = /\/molecule\/(?:[^/?#]+\/)?([^/?#]+\.hdt)$/u.exec(parsed.pathname);
+      return moleculeMatch?.[1]?.replace(/\.hdt$/u, '');
     } catch {
       return undefined;
     }
@@ -1042,6 +1070,48 @@ async function readStreamToString(stream: NodeJS.ReadableStream): Promise<string
     content += typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true });
   }
   return content + decoder.decode();
+}
+
+async function readStreamToBuffer(stream: NodeJS.ReadableStream): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream as any as AsyncIterable<Uint8Array | string>) {
+    chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
+
+function isHdtBuffer(buffer: Buffer): boolean {
+  return buffer.subarray(0, 4).toString('utf8') === '$HDT';
+}
+
+function extractTarEntries(buffer: Buffer): { name: string; payload: Buffer }[] {
+  const entries: { name: string; payload: Buffer }[] = [];
+  let offset = 0;
+
+  while (offset + 512 <= buffer.length) {
+    const header = buffer.subarray(offset, offset + 512);
+    if (header.every(byte => byte === 0)) {
+      break;
+    }
+
+    const name = header.subarray(0, 100).toString('utf8').replace(/\0.*$/u, '');
+    const sizeText = header.subarray(124, 136).toString('utf8').replace(/\0.*$/u, '').trim();
+    const size = Number.parseInt(sizeText, 8);
+    if (!name || !Number.isFinite(size) || size < 0) {
+      break;
+    }
+
+    const payloadStart = offset + 512;
+    const payloadEnd = payloadStart + size;
+    if (payloadEnd > buffer.length) {
+      break;
+    }
+
+    entries.push({ name, payload: buffer.subarray(payloadStart, payloadEnd) });
+    offset = payloadStart + Math.ceil(size / 512) * 512;
+  }
+
+  return entries;
 }
 
 async function sleep(ms: number): Promise<void> {

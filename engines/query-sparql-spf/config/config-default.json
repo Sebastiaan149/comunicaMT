@@ -1,0 +1,10 @@
+{
+  "@context": [
+    "https://linkedsoftwaredependencies.org/bundles/npm/@comunica/config-query-sparql/^5.0.0/components/context.jsonld"
+  ],
+  "import": [
+    "ccqs:config/config-default-v5-1-3.json",
+    "query-operation/actors-spf-bgp.json",
+    "query-source-identify-hypermedia/actors-spf.json"
+  ]
+}

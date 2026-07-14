@@ -13,7 +13,7 @@ import type { MetadataBindings } from '@comunica/types';
 import { Readable } from 'readable-stream';
 
 /**
- * A comunica Force SPARQL Query Source Hypermedia Resolve Actor.
+ * A comunica forced query source hypermedia resolve actor.
  */
 export class ActorQuerySourceDereferenceLinkForceSparql extends ActorQuerySourceDereferenceLink {
   public readonly mediatorMetadataAccumulate: MediatorRdfMetadataAccumulate;
@@ -26,16 +26,21 @@ export class ActorQuerySourceDereferenceLinkForceSparql extends ActorQuerySource
   }
 
   public async test(action: IActionQuerySourceDereferenceLink): Promise<TestResult<IActorTest>> {
-    if (action.link.forceSourceType === 'sparql' && action.context.get(KeysQueryOperation.querySources)?.length === 1) {
+    const forcedSourceTypesWithoutMetadataDereference = new Set([ 'sparql', 'passage' ]);
+    if (
+      action.link.forceSourceType &&
+      forcedSourceTypesWithoutMetadataDereference.has(action.link.forceSourceType) &&
+      action.context.get(KeysQueryOperation.querySources)?.length === 1
+    ) {
       return passTestVoid();
     }
-    return failTest(`${this.name} can only handle a single forced SPARQL source`);
+    return failTest(`${this.name} can only handle a single forced SPARQL or Passage source`);
   }
 
   public async run(action: IActionQuerySourceDereferenceLink): Promise<IActorQuerySourceDereferenceLinkOutput> {
     const context = action.link.context ? action.context.merge(action.link.context) : action.context;
 
-    // No need to do metadata extraction if we're querying over just a single SPARQL endpoint.
+    // No need to do metadata extraction if we're querying over a single forced endpoint.
     const quads: Readable = new Readable();
     quads._read = () => {
       quads.push(null);

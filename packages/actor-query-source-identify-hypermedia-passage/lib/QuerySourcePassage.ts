@@ -125,7 +125,7 @@ export class QuerySourcePassage implements IQuerySource {
       const variables = algebraUtils.inScopeVariables(operation);
       const undefVariables = QuerySourceSparql.getOperationUndefs(operation);
 
-      Actor.getContextLogger(context)?.info(`Asking for:\n${selectQuery}`);
+      Actor.getContextLogger(context)?.info(`Asking for:\n${selectQuery}`, {});
 
       return this.queryBindingsRemote(operation, this.url, selectQuery, variables, context, undefVariables);
     }, { autoStart: false });
@@ -223,7 +223,9 @@ export class QuerySourcePassage implements IQuerySource {
 
     const nextPromise: Promise<string | void> = new Promise(resolve => {
       rawStream.on('metadata', async(metadata: { next?: string }) => {
-        Actor.getContextLogger(this.context)?.info(`Next query to get complete result:\n${metadata.next}`);
+        if (metadata.next) {
+          Actor.getContextLogger(this.context)?.info(`Next query to get complete result:\n${metadata.next}`, {});
+        }
         resolve(metadata.next);
       });
       rawStream.on('end', async() => {

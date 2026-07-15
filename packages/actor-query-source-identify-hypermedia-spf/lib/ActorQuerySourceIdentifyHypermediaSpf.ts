@@ -13,6 +13,7 @@ import { KeysInitQuery } from '@comunica/context-entries';
 import type { TestResult } from '@comunica/core';
 import { failTest, passTest } from '@comunica/core';
 import {
+  createSpfSearchForm,
   detectSpfSearchForm,
   QuerySourceSpf,
 } from '@comunica/query-source-spf';
@@ -54,6 +55,9 @@ export class ActorQuerySourceIdentifyHypermediaSpf extends ActorQuerySourceIdent
   ): Promise<TestResult<IActorQuerySourceIdentifyHypermediaTest>> {
     const control = detectSpfSearchForm(action.metadata);
     if (!control) {
+      if (action.forceSourceType === 'spf') {
+        return passTest({ filterFactor: 1 });
+      }
       return failTest(`Actor ${this.name} requires an SPF Hydra control with subject/s, triples, star, and values fields.`);
     }
     if (action.handledDatasets && action.handledDatasets[control.searchForm.dataset]) {
@@ -74,10 +78,7 @@ export class ActorQuerySourceIdentifyHypermediaSpf extends ActorQuerySourceIdent
     metadata: Record<string, any>,
     context: IActionContext,
   ): Promise<QuerySourceSpf> {
-    const control = detectSpfSearchForm(metadata);
-    if (!control) {
-      throw new Error('Unable to create SPF source: metadata does not expose a complete SPF Hydra control.');
-    }
+    const control = detectSpfSearchForm(metadata) ?? createSpfSearchForm(url);
 
     const dataFactory: ComunicaDataFactory = context.getSafe(KeysInitQuery.dataFactory);
     const algebraFactory = new AlgebraFactory(dataFactory);

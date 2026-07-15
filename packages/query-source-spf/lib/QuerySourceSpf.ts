@@ -233,7 +233,7 @@ export class QuerySourceSpf implements IQuerySource {
     context: IActionContext,
     pageUrl?: string,
   ): Promise<ISpfPage> {
-    const url = createSpfRequestUrl(this.getControl(), star, bindings, this.maxMpR, pageUrl);
+    const url = createSpfRequestUrl(this.getControl(), star, deduplicateBindings(bindings), this.maxMpR, pageUrl);
     const dereferenceRdfOutput = await this.mediatorDereferenceRdf.mediate({ context, url });
     const rdfMetadataOutput: IActorRdfMetadataOutput = await this.mediatorMetadata.mediate({
       context,
@@ -280,6 +280,41 @@ export function detectSpfSearchForm(metadata: Record<string, any>): ISpfSourceCo
   }
 }
 
+export function createSpfSearchForm(url: string): ISpfSourceControl {
+  const dataset = stripQueryAndHash(url);
+  const template = `${dataset}{?s,triples,star,values}`;
+  const searchForm: ISearchForm = {
+    dataset,
+    template,
+    mappings: {
+      s: 's',
+      triples: 'triples',
+      star: 'star',
+      values: 'values',
+    },
+    getUri: (entries: Record<string, string>) => {
+      const params = new URLSearchParams();
+      for (const [ key, value ] of Object.entries(entries)) {
+        if (value !== undefined && value !== '') {
+          params.set(key, value);
+        }
+      }
+      const queryString = params.toString();
+      return queryString ? `${dataset}?${queryString}` : dataset;
+    },
+  };
+
+  return {
+    searchForm,
+    mappings: {
+      subject: 's',
+      triples: 'triples',
+      star: 'star',
+      values: 'values',
+    },
+  };
+}
+
 export function detectSpfMappings(searchForm: ISearchForm): ISpfSearchMappings | undefined {
   let subject: string | undefined;
   let triples: string | undefined;
@@ -305,17 +340,7 @@ export function detectSpfMappings(searchForm: ISearchForm): ISpfSearchMappings |
 }
 
 export function decomposeSubjectStars(patterns: Algebra.Pattern[]): ISpfStar[] {
-  const starsBySubject = new Map<string, ISpfStar>();
-  for (const pattern of patterns) {
-    const key = stableTermToString(pattern.subject);
-    let star = starsBySubject.get(key);
-    if (!star) {
-      star = { subject: pattern.subject, patterns: []};
-      starsBySubject.set(key, star);
-    }
-    star.patterns.push(pattern);
-  }
-  return [ ...starsBySubject.values() ];
+  return patterns.map(pattern => ({ subject: pattern.subject, patterns: [ pattern ]}));
 }
 
 export function createSpfRequestUrl(
@@ -325,20 +350,20 @@ export function createSpfRequestUrl(
   maxMpR: number = DEFAULT_MAX_MPR,
   pageUrl?: string,
 ): string {
-  if (pageUrl) {
-    return pageUrl;
-  }
-
   const entries: Record<string, string> = {};
-  if (star.subject.termType !== 'Variable') {
-    entries[control.mappings.subject] = termToString(star.subject);
-  }
+  entries[control.mappings.subject] = encodePatternTerm(star.subject);
   entries[control.mappings.triples] = String(star.patterns.length);
   entries[control.mappings.star] = encodeStar(star);
 
   const values = encodeValues(star, bindings.slice(0, maxMpR));
   if (values) {
     entries[control.mappings.values] = values;
+  }
+  if (pageUrl) {
+    const page = new URL(pageUrl).searchParams.get('page');
+    if (page) {
+      entries.page = page;
+    }
   }
 
   return control.searchForm.getUri(entries);
@@ -477,6 +502,7 @@ class BasicGraphPatternIterator implements IBindingChunkIterator {
   private async chooseNextStar(stars: ISpfStar[], currentBindings: BindingChunk): Promise<ISpfStarChoice> {
     let best: ISpfStarChoice | undefined;
     let firstAbsentCount: ISpfStarChoice | undefined;
+    const bound = hasBindings(currentBindings);
 
     for (const star of stars) {
       const firstPage = await this.source.fetchFirstSpfPage(star, currentBindings, this.context);
@@ -491,7 +517,7 @@ class BasicGraphPatternIterator implements IBindingChunkIterator {
       if (!Number.isFinite(count) || count < 0) {
         throw new Error(`Malformed SPF metadata: invalid void:triples cardinality '${count}'.`);
       }
-      if (!best || count < best.count!) {
+      if (!best || (bound ? count < best.count! : count > best.count!)) {
         best = { star, firstPage, count };
       }
     }
@@ -523,6 +549,7 @@ class QueryIterator {
 class SpfBindingsIterator extends BufferedIterator<RDF.Bindings> {
   private emitted = 0;
   private readonly state = new MetadataValidationState();
+  private readonly seenBindings = new Set<string>();
 
   public constructor(
     queryIteratorPromise: Promise<QueryIterator>,
@@ -544,6 +571,11 @@ class SpfBindingsIterator extends BufferedIterator<RDF.Bindings> {
       const queryIterator = await queryIteratorPromise;
       let binding: RDF.Bindings | undefined;
       while ((binding = await queryIterator.getNextBinding())) {
+        const key = bindingKey(binding);
+        if (this.seenBindings.has(key)) {
+          continue;
+        }
+        this.seenBindings.add(key);
         this.emitted++;
         this._push(binding);
       }
@@ -685,26 +717,32 @@ function mergeRecords(
 
 function encodeStar(star: ISpfStar): string {
   return star.patterns
-    .map(pattern => `${encodePatternTerm(pattern.predicate)} ${encodePatternTerm(pattern.object)}`)
-    .join(' ; ');
+    .flatMap((pattern, index) => {
+      const position = index + 1;
+      return [
+        `p${position},${encodePatternTerm(pattern.predicate)}`,
+        `o${position},${encodePatternTerm(pattern.object)}`,
+      ];
+    })
+    .join(';')
+    .replace(/^/, '[')
+    .replace(/$/, ']');
 }
 
 function encodeValues(star: ISpfStar, bindings: BindingChunk): string | undefined {
-  const variables = [ ...getStarVariables(star) ]
-    .filter(variable => bindings.some(binding => Boolean(binding.get(variable))))
-    .sort();
-  if (variables.length === 0) {
+  const fields = getBoundStarFields(star, bindings);
+  if (fields.length === 0) {
     return;
   }
 
   const rows = bindings.map((binding) => {
-    const values = variables.map((variable) => {
-      const term = binding.get(variable);
+    const values = fields.map((field) => {
+      const term = binding.get(field.variable);
       return term ? termToStringTtl(term) : 'UNDEF';
     });
     return `(${values.join(' ')})`;
   });
-  return `(${variables.map(variable => `?${variable}`).join(' ')}) { ${rows.join(' ')} }`;
+  return `(${fields.map(field => `?${field.field}`).join(' ')}) { ${rows.join(' ')} }`;
 }
 
 function encodePatternTerm(term: RDF.Term): string {
@@ -721,6 +759,36 @@ function getStarVariables(star: ISpfStar): Set<string> {
     }
   }
   return variables;
+}
+
+function getBoundStarFields(
+  star: ISpfStar,
+  bindings: BindingChunk,
+): { variable: string; field: string }[] {
+  const fields: { variable: string; field: string }[] = [];
+  const seen = new Set<string>();
+  const addField = (term: RDF.Term, field: string): void => {
+    if (term.termType !== 'Variable' || !bindings.some(binding => Boolean(binding.get(term.value)))) {
+      return;
+    }
+    const key = `${term.value}:${field}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      fields.push({ variable: term.value, field });
+    }
+  };
+
+  addField(star.subject, 'subject');
+  star.patterns.forEach((pattern, index) => {
+    const position = index + 1;
+    addField(pattern.predicate, `p${position}`);
+    addField(pattern.object, `o${position}`);
+  });
+  return fields;
+}
+
+function hasBindings(bindings: BindingChunk): boolean {
+  return bindings.some(binding => [ ...binding ].length > 0);
 }
 
 function collectPatterns(operation: Algebra.Operation): Algebra.Pattern[] {
@@ -898,4 +966,11 @@ function getHydraPropertyName(property: string): string {
 
 function stableTermToString(term: RDF.Term): string {
   return termToString(term);
+}
+
+function stripQueryAndHash(url: string): string {
+  const parsed = new URL(url);
+  parsed.search = '';
+  parsed.hash = '';
+  return parsed.toString().replace(/\/$/, '');
 }

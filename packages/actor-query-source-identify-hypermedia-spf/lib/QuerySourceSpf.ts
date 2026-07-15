@@ -22,10 +22,8 @@ import { Readable } from 'stream';
 
 const VOID_TRIPLES = 'http://rdfs.org/ns/void#triples';
 const DEFAULT_MAX_MPR = 50;
+const MAX_PATTERNS_PER_SPF_STAR = 8;
 const SOURCE_TYPE = 'spf';
-const SPLIT_STAR_PREDICATES = new Set([
-  'http://db.uwaterloo.ca/~galuc/wsdbm/follows',
-]);
 
 export interface ISpfSearchMappings {
   subject: string;
@@ -355,15 +353,15 @@ export function decomposeSubjectStars(patterns: Algebra.Pattern[]): ISpfStar[] {
   }
   const decomposedStars: ISpfStar[] = [];
   for (const star of stars.values()) {
-    const splitPatterns = star.patterns.filter(pattern =>
-      pattern.predicate.termType !== 'Variable' && SPLIT_STAR_PREDICATES.has(termToString(pattern.predicate)));
-    const groupedPatterns = star.patterns.filter(pattern => !splitPatterns.includes(pattern));
-    if (groupedPatterns.length > 0) {
-      decomposedStars.push({ subject: star.subject, patterns: groupedPatterns });
+    if (star.patterns.length <= MAX_PATTERNS_PER_SPF_STAR) {
+      decomposedStars.push(star);
+      continue;
     }
-    for (const pattern of splitPatterns) {
-      decomposedStars.push({ subject: star.subject, patterns: [ pattern ]});
+    const oversizedPatternCount = star.patterns.length - MAX_PATTERNS_PER_SPF_STAR;
+    for (let index = 0; index < oversizedPatternCount; index++) {
+      decomposedStars.push({ subject: star.subject, patterns: [ star.patterns[index] ]});
     }
+    decomposedStars.push({ subject: star.subject, patterns: star.patterns.slice(oversizedPatternCount) });
   }
   return decomposedStars;
 }

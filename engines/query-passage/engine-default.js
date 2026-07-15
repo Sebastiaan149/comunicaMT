@@ -567,13 +567,13 @@ const urn_comunica_default_function_factory_actors_expression_function_bound = n
   'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_function_factory__5_0_0_components_ActorFunctionFactory_jsonld_ActorFunctionFactory_default_bus,
   'busFailMessage': 'Creation of function evaluator failed: no configured actor was able to evaluate function ${action.functionName}'
 });
-const urn_comunica_default_function_factory_actors_expression_function_concat = new (require('@comunica/actor-function-factory-expression-concat').ActorFunctionFactoryExpressionConcat)({
-  'name': 'urn:comunica:default:function-factory/actors#expression-function-concat',
+const urn_comunica_default_function_factory_actors_expression_function_coalesce = new (require('@comunica/actor-function-factory-expression-coalesce').ActorFunctionFactoryExpressionCoalesce)({
+  'name': 'urn:comunica:default:function-factory/actors#expression-function-coalesce',
   'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_function_factory__5_0_0_components_ActorFunctionFactory_jsonld_ActorFunctionFactory_default_bus,
   'busFailMessage': 'Creation of function evaluator failed: no configured actor was able to evaluate function ${action.functionName}'
 });
-const urn_comunica_default_function_factory_actors_expression_function_coalesce = new (require('@comunica/actor-function-factory-expression-coalesce').ActorFunctionFactoryExpressionCoalesce)({
-  'name': 'urn:comunica:default:function-factory/actors#expression-function-coalesce',
+const urn_comunica_default_function_factory_actors_expression_function_concat = new (require('@comunica/actor-function-factory-expression-concat').ActorFunctionFactoryExpressionConcat)({
+  'name': 'urn:comunica:default:function-factory/actors#expression-function-concat',
   'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_function_factory__5_0_0_components_ActorFunctionFactory_jsonld_ActorFunctionFactory_default_bus,
   'busFailMessage': 'Creation of function evaluator failed: no configured actor was able to evaluate function ${action.functionName}'
 });
@@ -2051,8 +2051,8 @@ const urn_comunica_default_Runner = (https___linkedsoftwaredependencies_org_bund
   urn_comunica_default_expression_evaluator_factory_actors_default,
   urn_comunica_default_function_factory_actors_expression_function_bnode,
   urn_comunica_default_function_factory_actors_expression_function_bound,
-  urn_comunica_default_function_factory_actors_expression_function_concat,
   urn_comunica_default_function_factory_actors_expression_function_coalesce,
+  urn_comunica_default_function_factory_actors_expression_function_concat,
   urn_comunica_default_function_factory_actors_expression_function_extensions,
   urn_comunica_default_function_factory_actors_expression_function_if,
   urn_comunica_default_function_factory_actors_expression_function_in,
@@ -2069,8 +2069,8 @@ const urn_comunica_default_Runner = (https___linkedsoftwaredependencies_org_bund
   urn_comunica_default_function_factory_actors_term_function_division,
   urn_comunica_default_function_factory_actors_term_function_encode_for_uri,
   urn_comunica_default_function_factory_actors_term_function_equality,
-  urn_comunica_default_function_factory_actors_term_function_greater_than_equal,
   urn_comunica_default_function_factory_actors_term_function_floor,
+  urn_comunica_default_function_factory_actors_term_function_greater_than_equal,
   urn_comunica_default_function_factory_actors_term_function_greater_than,
   urn_comunica_default_function_factory_actors_term_function_has_lang,
   urn_comunica_default_function_factory_actors_term_function_has_langdir,

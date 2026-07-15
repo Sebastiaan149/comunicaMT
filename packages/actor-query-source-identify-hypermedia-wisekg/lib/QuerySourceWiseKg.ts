@@ -39,6 +39,9 @@ import {
   setContextFlag,
 } from './Utils';
 
+const DEFAULT_PLAN_SPEED_MBPS = 1;
+const DEFAULT_PLAN_LATENCY_MS = 1_000;
+
 function createMetadataValidationState(): MetadataBindings['state'] {
   const listeners: Array<() => void> = [];
   const state: MetadataBindings['state'] = {
@@ -60,24 +63,16 @@ function createMetadataValidationState(): MetadataBindings['state'] {
 }
 
 class HdtDocumentCache {
-  private readonly cache = new Map<string, { document: HDT.Document; refCount: number }>();
+  private readonly cache = new Map<string, Promise<HDT.Document>>();
 
   public async getDocument(path: string): Promise<HDT.Document> {
     const existing = this.cache.get(path);
     if (existing) {
-      existing.refCount++;
-      return existing.document;
+      return existing;
     }
-    const document = await (HDT as any).fromFile(path);
-    this.cache.set(path, { document, refCount: 1 });
-    return document;
-  }
-
-  public releaseDocument(path: string): void {
-    const entry = this.cache.get(path);
-    if (entry) {
-      entry.refCount = Math.max(0, entry.refCount - 1);
-    }
+    const documentPromise = (HDT as any).fromFile(path);
+    this.cache.set(path, documentPromise);
+    return documentPromise;
   }
 
   public async dispose(): Promise<void> {
@@ -129,6 +124,8 @@ export class QuerySourceWiseKg implements IQuerySource {
   private readonly planUrl: string;
   private readonly mediatorQuerySourceDereferenceLink?: any;
   private readonly patternCardinalityCache = new Map<string, number>();
+  private readonly planCache = new Map<string, IWiseKgFetchedPlan>();
+  private readonly hdtPatternCache = new Map<string, Promise<RDF.Bindings[]>>();
   private bindingsFactory: BindingsFactory | undefined;
 
   public constructor(
@@ -279,6 +276,15 @@ export class QuerySourceWiseKg implements IQuerySource {
     context: IActionContext,
   ): Promise<IWiseKgFetchedPlan | undefined> {
     const url = this.buildWiseKgPlanUrl(patterns, context);
+    const cached = this.planCache.get(url);
+    if (cached && (!cached.expiresAt || Date.now() <= cached.expiresAt)) {
+      this.logDebug(context, `WiseKG reusing cached plan ${url}`);
+      return cached;
+    }
+    if (cached) {
+      this.planCache.delete(url);
+    }
+
     const maxAttempts = 3;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
@@ -309,11 +315,13 @@ export class QuerySourceWiseKg implements IQuerySource {
           this.logDebug(context, `WiseKG plan step control ${step.control}`);
         }
 
-        return {
+        const fetchedPlan = {
           plan,
           steps,
           expiresAt: getWiseKgPlanExpiry(plan),
         };
+        this.planCache.set(url, fetchedPlan);
+        return fetchedPlan;
       } catch (error) {
         if (attempt === maxAttempts) {
           this.logDebug(context, 'WiseKG /plan request failed; falling back.', { error });
@@ -329,14 +337,10 @@ export class QuerySourceWiseKg implements IQuerySource {
   private buildWiseKgPlanUrl(patterns: Algebra.Pattern[], context: IActionContext): string {
     const serializedBgp = this.serializeBgpForPlan(patterns);
     const parameters = [ `bgp=${encodeURIComponent(serializedBgp)}` ];
-    const speed = getContextRaw<string | number>(context, KEY_CONTEXT_WISEKG_SPEED_MBPS);
-    const latency = getContextRaw<string | number>(context, KEY_CONTEXT_WISEKG_LATENCY_MS);
-    if (speed !== undefined) {
-      parameters.push(`speed=${encodeURIComponent(String(speed))}`);
-    }
-    if (latency !== undefined) {
-      parameters.push(`latency=${encodeURIComponent(String(latency))}`);
-    }
+    const speed = getContextRaw<string | number>(context, KEY_CONTEXT_WISEKG_SPEED_MBPS) ?? DEFAULT_PLAN_SPEED_MBPS;
+    const latency = getContextRaw<string | number>(context, KEY_CONTEXT_WISEKG_LATENCY_MS) ?? DEFAULT_PLAN_LATENCY_MS;
+    parameters.push(`speed=${encodeURIComponent(String(speed))}`);
+    parameters.push(`latency=${encodeURIComponent(String(latency))}`);
     return `${this.planUrl}?${parameters.join('&')}`;
   }
 
@@ -534,26 +538,37 @@ export class QuerySourceWiseKg implements IQuerySource {
 
   private async evaluatePatternsOnPartition(partitionPath: string, patterns: Algebra.Pattern[]): Promise<RDF.Bindings[]> {
     const document = await this.hdtCache.getDocument(partitionPath);
-    try {
-      let results: RDF.Bindings[] = [ await this.emptyBinding() ];
+    let results: RDF.Bindings[] = [ await this.emptyBinding() ];
 
-      for (const pattern of patterns) {
-        const bindings = await this.collectHdtBindings(document, pattern);
-        results = this.deduplicateBindings(await this.joinBindingsLists(results, bindings));
-        if (results.length === 0) {
-          break;
-        }
+    for (const pattern of patterns) {
+      const bindings = await this.collectCachedHdtBindings(partitionPath, document, pattern);
+      results = this.deduplicateBindings(await this.joinBindingsLists(results, bindings));
+      if (results.length === 0) {
+        break;
       }
-
-      return this.deduplicateBindings(results);
-    } finally {
-      this.hdtCache.releaseDocument(partitionPath);
     }
+
+    return this.deduplicateBindings(results);
+  }
+
+  private collectCachedHdtBindings(
+    partitionPath: string,
+    document: HDT.Document,
+    pattern: Algebra.Pattern,
+  ): Promise<RDF.Bindings[]> {
+    const cacheKey = `${partitionPath}|${patternKey(pattern)}`;
+    const cached = this.hdtPatternCache.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+    const promise = this.collectHdtBindings(document, pattern);
+    this.hdtPatternCache.set(cacheKey, promise);
+    return promise;
   }
 
   private async collectHdtBindings(document: HDT.Document, pattern: Algebra.Pattern): Promise<RDF.Bindings[]> {
     const bindingsFactory = await this.getBindingsFactory();
-    const pageSize = 128;
+    const pageSize = 4096;
     let offset = 0;
     const results: RDF.Bindings[] = [];
 
@@ -866,30 +881,19 @@ export class QuerySourceWiseKg implements IQuerySource {
   }
 
   private async joinBindingsLists(left: RDF.Bindings[], right: RDF.Bindings[]): Promise<RDF.Bindings[]> {
+    const bindingsFactory = await this.getBindingsFactory();
     const results: RDF.Bindings[] = [];
-    for (const leftBinding of left) {
-      for (const rightBinding of right) {
-        if (this.areBindingsCompatible(leftBinding, rightBinding)) {
-          results.push(await this.mergeBindings(leftBinding, rightBinding));
+    const leftRecords = left.map(bindingToRecord);
+    const rightRecords = right.map(bindingToRecord);
+
+    for (const leftMap of leftRecords) {
+      for (const rightMap of rightRecords) {
+        if (areBindingRecordsCompatible(leftMap, rightMap)) {
+          results.push(bindingsFactory.fromRecord({ ...leftMap, ...rightMap }));
         }
       }
     }
     return results;
-  }
-
-  private areBindingsCompatible(left: RDF.Bindings, right: RDF.Bindings): boolean {
-    const leftMap = bindingToRecord(left);
-    for (const [ variable, value ] of right) {
-      if (leftMap[variable.value] && !leftMap[variable.value].equals(value)) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  private async mergeBindings(left: RDF.Bindings, right: RDF.Bindings): Promise<RDF.Bindings> {
-    const bindingsFactory = await this.getBindingsFactory();
-    return bindingsFactory.fromRecord({ ...bindingToRecord(left), ...bindingToRecord(right) });
   }
 
   private deduplicateBindings(bindings: RDF.Bindings[]): RDF.Bindings[] {
@@ -990,6 +994,15 @@ function bindingToRecord(binding: RDF.Bindings): Record<string, RDF.Term> {
     record[variable.value] = value;
   }
   return record;
+}
+
+function areBindingRecordsCompatible(left: Record<string, RDF.Term>, right: Record<string, RDF.Term>): boolean {
+  for (const [ variable, value ] of Object.entries(right)) {
+    if (left[variable] && !left[variable].equals(value)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function patternKey(pattern: Algebra.Pattern): string {

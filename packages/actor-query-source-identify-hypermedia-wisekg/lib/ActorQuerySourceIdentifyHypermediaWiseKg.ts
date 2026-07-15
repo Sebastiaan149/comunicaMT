@@ -30,7 +30,7 @@ export class ActorQuerySourceIdentifyHypermediaWiseKg extends ActorQuerySourceId
       return failTest(`Actor ${this.name} ignores WiseKG fallback delegation contexts.`);
     }
 
-    if (action.forceSourceType && action.forceSourceType !== 'wisekg') {
+    if (action.forceSourceType && action.forceSourceType !== 'wisekg' && action.forceSourceType !== 'smartkg+') {
       return failTest(`Actor ${this.name} is not able to handle source type ${action.forceSourceType}.`);
     }
     return this.testMetadata(action);
@@ -43,7 +43,7 @@ export class ActorQuerySourceIdentifyHypermediaWiseKg extends ActorQuerySourceId
       return failTest(`Actor ${this.name} ignores WiseKG fallback delegation contexts.`);
     }
 
-    if (action.forceSourceType === 'wisekg' || isRootDatasetUrl(action.url)) {
+    if (action.forceSourceType === 'wisekg' || action.forceSourceType === 'smartkg+' || isRootDatasetUrl(action.url)) {
       return passTest({ filterFactor: 2 });
     }
 

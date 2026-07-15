@@ -677,13 +677,13 @@ const urn_comunica_default_function_factory_actors_term_function_is_blank = new 
   'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_function_factory__5_0_0_components_ActorFunctionFactory_jsonld_ActorFunctionFactory_default_bus,
   'busFailMessage': 'Creation of function evaluator failed: no configured actor was able to evaluate function ${action.functionName}'
 });
-const urn_comunica_default_function_factory_actors_term_function_is_literal = new (require('@comunica/actor-function-factory-term-is-literal').ActorFunctionFactoryTermIsLiteral)({
-  'name': 'urn:comunica:default:function-factory/actors#term-function-is-literal',
+const urn_comunica_default_function_factory_actors_term_function_is_iri = new (require('@comunica/actor-function-factory-term-is-iri').ActorFunctionFactoryTermIsIri)({
+  'name': 'urn:comunica:default:function-factory/actors#term-function-is-iri',
   'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_function_factory__5_0_0_components_ActorFunctionFactory_jsonld_ActorFunctionFactory_default_bus,
   'busFailMessage': 'Creation of function evaluator failed: no configured actor was able to evaluate function ${action.functionName}'
 });
-const urn_comunica_default_function_factory_actors_term_function_is_iri = new (require('@comunica/actor-function-factory-term-is-iri').ActorFunctionFactoryTermIsIri)({
-  'name': 'urn:comunica:default:function-factory/actors#term-function-is-iri',
+const urn_comunica_default_function_factory_actors_term_function_is_literal = new (require('@comunica/actor-function-factory-term-is-literal').ActorFunctionFactoryTermIsLiteral)({
+  'name': 'urn:comunica:default:function-factory/actors#term-function-is-literal',
   'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_function_factory__5_0_0_components_ActorFunctionFactory_jsonld_ActorFunctionFactory_default_bus,
   'busFailMessage': 'Creation of function evaluator failed: no configured actor was able to evaluate function ${action.functionName}'
 });
@@ -2117,8 +2117,8 @@ const urn_comunica_default_Runner = (https___linkedsoftwaredependencies_org_bund
   urn_comunica_default_function_factory_actors_term_function_inequality,
   urn_comunica_default_function_factory_actors_term_function_iri,
   urn_comunica_default_function_factory_actors_term_function_is_blank,
-  urn_comunica_default_function_factory_actors_term_function_is_literal,
   urn_comunica_default_function_factory_actors_term_function_is_iri,
+  urn_comunica_default_function_factory_actors_term_function_is_literal,
   urn_comunica_default_function_factory_actors_term_function_is_numeric,
   urn_comunica_default_function_factory_actors_term_function_is_triple,
   urn_comunica_default_function_factory_actors_term_function_lang,

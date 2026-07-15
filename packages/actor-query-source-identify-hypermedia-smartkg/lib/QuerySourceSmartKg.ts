@@ -31,6 +31,8 @@ import {
   selectOptimalFamilies,
 } from './Utils';
 
+const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
+
 function createMetadataValidationState(): MetadataBindings['state'] {
   const listeners: Array<() => void> = [];
   const state: MetadataBindings['state'] = {
@@ -52,24 +54,16 @@ function createMetadataValidationState(): MetadataBindings['state'] {
 }
 
 class HdtDocumentCache {
-  private readonly cache = new Map<string, { document: HDT.Document; refCount: number }>();
+  private readonly cache = new Map<string, Promise<HDT.Document>>();
 
   public async getDocument(path: string): Promise<HDT.Document> {
     const existing = this.cache.get(path);
     if (existing) {
-      existing.refCount++;
-      return existing.document;
+      return existing;
     }
-    const document = await (HDT as any).fromFile(path);
-    this.cache.set(path, { document, refCount: 1 });
-    return document;
-  }
-
-  public releaseDocument(path: string): void {
-    const entry = this.cache.get(path);
-    if (entry) {
-      entry.refCount = Math.max(0, entry.refCount - 1);
-    }
+    const documentPromise = (HDT as any).fromFile(path);
+    this.cache.set(path, documentPromise);
+    return documentPromise;
   }
 
   public async dispose(): Promise<void> {
@@ -120,6 +114,8 @@ export class QuerySourceSmartKg implements IQuerySource {
   private readonly partitionsBaseUrl: string;
   private readonly mediatorQuerySourceDereferenceLink?: any;
   private readonly smartKgPlusSource: boolean;
+  private readonly hdtPatternCache = new Map<string, Promise<RDF.Bindings[]>>();
+  private readonly patternCardinalityCache = new Map<string, number>();
   private bindingsFactory: BindingsFactory | undefined;
   private metadata: ISmartKgMetadata | undefined;
 
@@ -309,10 +305,8 @@ export class QuerySourceSmartKg implements IQuerySource {
     options?: IQueryBindingsOptions,
   ): Promise<RDF.Bindings[]> {
     const metadata = await this.fetchMetadata();
-    if (this.smartKgPlusSource && patterns.some(pattern => hasPredicate(pattern, 'http://db.uwaterloo.ca/~galuc/wsdbm/makesPurchase'))) {
-      return this.queryPatternsViaOriginalSource(patterns, context, options);
-    }
-    if (patterns.length >= 2 && isStarEligibleForPartitions(patterns, metadata)) {
+    const canUseTypedPartitions = !this.smartKgPlusSource || !hasUnboundTypeClass(patterns);
+    if (canUseTypedPartitions && patterns.length >= 2 && isStarEligibleForPartitions(patterns, metadata)) {
       return this.queryPatternsViaPartitions(patterns, context, options);
     }
 
@@ -324,8 +318,11 @@ export class QuerySourceSmartKg implements IQuerySource {
     context: IActionContext,
     options?: IQueryBindingsOptions,
   ): Promise<RDF.Bindings[]> {
+    const orderedPatterns = this.smartKgPlusSource ?
+      await this.sortPatternsByOriginalSourceCardinality(patterns, context) :
+      patterns;
     let results: RDF.Bindings[] = [ await this.emptyBinding() ];
-    for (const pattern of patterns) {
+    for (const pattern of orderedPatterns) {
       const stream = await this.queryFallbackBindings(pattern, context, options);
       const bindings = await this.collectBindingsFromStream(stream);
       results = await this.joinBindingsLists(results, bindings);
@@ -333,8 +330,76 @@ export class QuerySourceSmartKg implements IQuerySource {
     return deduplicateBindings(results);
   }
 
+  private async sortPatternsByOriginalSourceCardinality(
+    patterns: Algebra.Pattern[],
+    context: IActionContext,
+  ): Promise<Algebra.Pattern[]> {
+    const estimated = await Promise.all(patterns.map(async pattern => ({
+      pattern,
+      cardinality: await this.estimateOriginalSourcePatternCardinality(pattern, context),
+    })));
+    return estimated
+      .sort((left, right) => left.cardinality - right.cardinality)
+      .map(entry => entry.pattern);
+  }
+
+  private async estimateOriginalSourcePatternCardinality(
+    pattern: Algebra.Pattern,
+    _context: IActionContext,
+  ): Promise<number> {
+    const key = patternToKey(pattern);
+    const cached = this.patternCardinalityCache.get(key);
+    if (cached !== undefined) {
+      return cached;
+    }
+
+    const url = this.buildOriginalSourcePatternUrl(pattern);
+    try {
+      const response = await this.mediatorHttp.mediate({ context: this.defaultContext, input: url });
+      if (response.ok === false) {
+        return Number.MAX_SAFE_INTEGER;
+      }
+      const body = ActorHttp.toNodeReadable(response.body);
+      const content = await readStreamToString(body);
+      const cardinality = parseTpfCardinality(content) ?? Number.MAX_SAFE_INTEGER;
+      this.patternCardinalityCache.set(key, cardinality);
+      return cardinality;
+    } catch {
+      return Number.MAX_SAFE_INTEGER;
+    }
+  }
+
+  private buildOriginalSourcePatternUrl(pattern: Algebra.Pattern): string {
+    const parameters = new URLSearchParams();
+    this.appendOriginalSourcePatternParameter(parameters, 'subject', pattern.subject);
+    this.appendOriginalSourcePatternParameter(parameters, 'predicate', pattern.predicate);
+    this.appendOriginalSourcePatternParameter(parameters, 'object', pattern.object);
+    const queryString = parameters.toString();
+    return queryString.length > 0 ? `${this.originalSourceUrl}?${queryString}` : this.originalSourceUrl;
+  }
+
+  private appendOriginalSourcePatternParameter(parameters: URLSearchParams, key: string, term: RDF.Term): void {
+    const value = this.termToOriginalSourceParameter(term);
+    if (value !== undefined) {
+      parameters.append(key, value);
+    }
+  }
+
+  private termToOriginalSourceParameter(term: RDF.Term): string | undefined {
+    if (term.termType === 'Variable') {
+      return undefined;
+    }
+    if (term.termType === 'NamedNode') {
+      return term.value;
+    }
+    return termToString(term);
+  }
+
   private async shouldUsePartitions(pattern: Algebra.Pattern, context: IActionContext): Promise<boolean> {
     if (pattern.predicate.termType === 'Variable') {
+      return false;
+    }
+    if (this.smartKgPlusSource && hasUnboundTypeClass([ pattern ])) {
       return false;
     }
 
@@ -530,26 +595,37 @@ export class QuerySourceSmartKg implements IQuerySource {
 
   private async evaluatePatternsOnPartition(partitionPath: string, patterns: Algebra.Pattern[]): Promise<RDF.Bindings[]> {
     const document = await this.hdtCache.getDocument(partitionPath);
-    try {
-      let results: RDF.Bindings[] = [ await this.emptyBinding() ];
+    let results: RDF.Bindings[] = [ await this.emptyBinding() ];
 
-      for (const pattern of patterns) {
-        const bindings = await this.collectHdtBindings(document, pattern);
-        results = deduplicateBindings(await this.joinBindingsLists(results, bindings));
-        if (results.length === 0) {
-          break;
-        }
+    for (const pattern of patterns) {
+      const bindings = await this.collectCachedHdtBindings(partitionPath, document, pattern);
+      results = deduplicateBindings(await this.joinBindingsLists(results, bindings));
+      if (results.length === 0) {
+        break;
       }
-
-      return deduplicateBindings(results);
-    } finally {
-      this.hdtCache.releaseDocument(partitionPath);
     }
+
+    return deduplicateBindings(results);
+  }
+
+  private collectCachedHdtBindings(
+    partitionPath: string,
+    document: any,
+    pattern: Algebra.Pattern,
+  ): Promise<RDF.Bindings[]> {
+    const cacheKey = `${partitionPath}|${patternToKey(pattern)}`;
+    const cached = this.hdtPatternCache.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+    const promise = this.collectHdtBindings(document, pattern);
+    this.hdtPatternCache.set(cacheKey, promise);
+    return promise;
   }
 
   private async collectHdtBindings(document: any, pattern: Algebra.Pattern): Promise<RDF.Bindings[]> {
     const bindingsFactory = await this.getBindingsFactory();
-    const pageSize = 128;
+    const pageSize = 4096;
     let offset = 0;
     const results: RDF.Bindings[] = [];
 
@@ -742,10 +818,11 @@ export class QuerySourceSmartKg implements IQuerySource {
   private async joinBindingsLists(left: RDF.Bindings[], right: RDF.Bindings[]): Promise<RDF.Bindings[]> {
     const bindingsFactory = await this.getBindingsFactory();
     const results: RDF.Bindings[] = [];
-    for (const leftBinding of left) {
-      const leftMap = bindingToRecord(leftBinding);
-      for (const rightBinding of right) {
-        const rightMap = bindingToRecord(rightBinding);
+    const leftRecords = left.map(bindingToRecord);
+    const rightRecords = right.map(bindingToRecord);
+
+    for (const leftMap of leftRecords) {
+      for (const rightMap of rightRecords) {
         let compatible = true;
         for (const [ key, value ] of Object.entries(rightMap)) {
           if (leftMap[key] && !leftMap[key].equals(value)) {
@@ -1021,8 +1098,11 @@ function isPatternPredicateContainedInSet(pattern: Algebra.Pattern, predicates: 
   return pattern.predicate.termType !== 'Variable' && predicates.has(termToString(pattern.predicate));
 }
 
-function hasPredicate(pattern: Algebra.Pattern, predicate: string): boolean {
-  return pattern.predicate.termType !== 'Variable' && termToString(pattern.predicate) === predicate;
+function hasUnboundTypeClass(patterns: Algebra.Pattern[]): boolean {
+  return patterns.some(pattern =>
+    pattern.predicate.termType !== 'Variable' &&
+    termToString(pattern.predicate) === RDF_TYPE &&
+    pattern.object.termType === 'Variable');
 }
 
 function patternToKey(pattern: Algebra.Pattern): string {
@@ -1095,6 +1175,12 @@ async function readStreamToString(stream: NodeJS.ReadableStream): Promise<string
     chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
   }
   return Buffer.concat(chunks).toString('utf8');
+}
+
+function parseTpfCardinality(content: string): number | undefined {
+  const match = /(?:hydra:totalItems|void:triples|<http:\/\/www\.w3\.org\/ns\/hydra\/core#totalItems>|<http:\/\/rdfs\.org\/ns\/void#triples>)\s+"?(\d+)/u
+    .exec(content);
+  return match ? Number(match[1]) : undefined;
 }
 
 async function readStreamToBuffer(stream: NodeJS.ReadableStream): Promise<Buffer> {

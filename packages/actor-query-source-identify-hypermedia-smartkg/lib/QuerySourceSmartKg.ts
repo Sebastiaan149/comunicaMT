@@ -1,4 +1,4 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync } from 'fs';
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { IActionHttp, IActorHttpOutput } from '@comunica/bus-http';
 import { ActorHttp } from '@comunica/bus-http';
@@ -119,6 +119,7 @@ export class QuerySourceSmartKg implements IQuerySource {
   private readonly metadataUrl: string;
   private readonly partitionsBaseUrl: string;
   private readonly mediatorQuerySourceDereferenceLink?: any;
+  private readonly smartKgPlusSource: boolean;
   private bindingsFactory: BindingsFactory | undefined;
   private metadata: ISmartKgMetadata | undefined;
 
@@ -137,6 +138,7 @@ export class QuerySourceSmartKg implements IQuerySource {
     this.originalSourceUrl = normalizedUrl;
     this.metadataUrl = `${origin}/molecule/${datasetName}`;
     this.partitionsBaseUrl = `${origin}/molecule/${datasetName}`;
+    this.smartKgPlusSource = datasetName.toLowerCase() === 'smartkg+';
     this.dataFactory = dataFactory;
     this.mediatorHttp = mediatorHttp;
     this.defaultContext = context;
@@ -307,10 +309,21 @@ export class QuerySourceSmartKg implements IQuerySource {
     options?: IQueryBindingsOptions,
   ): Promise<RDF.Bindings[]> {
     const metadata = await this.fetchMetadata();
+    if (this.smartKgPlusSource && patterns.some(pattern => hasPredicate(pattern, 'http://db.uwaterloo.ca/~galuc/wsdbm/makesPurchase'))) {
+      return this.queryPatternsViaOriginalSource(patterns, context, options);
+    }
     if (patterns.length >= 2 && isStarEligibleForPartitions(patterns, metadata)) {
       return this.queryPatternsViaPartitions(patterns, context, options);
     }
 
+    return this.queryPatternsViaOriginalSource(patterns, context, options);
+  }
+
+  private async queryPatternsViaOriginalSource(
+    patterns: Algebra.Pattern[],
+    context: IActionContext,
+    options?: IQueryBindingsOptions,
+  ): Promise<RDF.Bindings[]> {
     let results: RDF.Bindings[] = [ await this.emptyBinding() ];
     for (const pattern of patterns) {
       const stream = await this.queryFallbackBindings(pattern, context, options);
@@ -342,12 +355,12 @@ export class QuerySourceSmartKg implements IQuerySource {
 
     const candidateFamilies = selectCompatibleStarFamilies(patterns, metadata);
     if (candidateFamilies.length === 0) {
-      return [];
+      return this.queryPatternsViaAllPartitionFamilies(patterns, metadata);
     }
 
     const scopedFamilies = selectStarScopedMaterializedFamilies(patterns, candidateFamilies, metadata);
     if (scopedFamilies.completeFamilies.length === 0 && scopedFamilies.partialFamilies.length === 0) {
-      return [];
+      return this.queryPatternsViaAllPartitionFamilies(patterns, metadata);
     }
 
     const completeResults = await this.queryPatternsOnMaterializedFamilies(patterns, scopedFamilies.completeFamilies);
@@ -361,7 +374,28 @@ export class QuerySourceSmartKg implements IQuerySource {
         options,
       ) :
       [];
-    return deduplicateBindings([ ...completeResults, ...results, ...hybridResults ]);
+    const scopedResults = deduplicateBindings([ ...completeResults, ...results, ...hybridResults ]);
+    if (!this.smartKgPlusSource) {
+      return scopedResults;
+    }
+
+    const exhaustiveResults = await this.queryPatternsViaAllPartitionFamilies(patterns, metadata);
+    return exhaustiveResults.length > scopedResults.length ? exhaustiveResults : scopedResults;
+  }
+
+  private async queryPatternsViaAllPartitionFamilies(
+    patterns: Algebra.Pattern[],
+    metadata: ISmartKgMetadata,
+  ): Promise<RDF.Bindings[]> {
+    let results: RDF.Bindings[] = [ await this.emptyBinding() ];
+    for (const pattern of sortPatternsByEstimatedPartitionSize(patterns, metadata)) {
+      const patternResults = await this.queryPatternViaPartitions(pattern, metadata);
+      results = deduplicateBindings(await this.joinBindingsLists(results, patternResults));
+      if (results.length === 0) {
+        break;
+      }
+    }
+    return deduplicateBindings(results);
   }
 
   private async queryPatternsViaPartitionFamilies(
@@ -570,12 +604,12 @@ export class QuerySourceSmartKg implements IQuerySource {
       }
       seenLinks.add(nextUrl);
 
-      const result = await this.mediatorQuerySourceDereferenceLink.mediate({
+      const sourceResult = await this.mediatorQuerySourceDereferenceLink.mediate({
         context: fallbackContext,
         link: { url: nextUrl },
         handledDatasets,
       });
-      const source = result?.source;
+      const source = sourceResult?.source;
       if (!source || typeof source.queryBindings !== 'function') {
         continue;
       }
@@ -585,9 +619,7 @@ export class QuerySourceSmartKg implements IQuerySource {
       results.push(...bindings);
 
       const streamNextLinks = getMetadataNextLinks(metadata);
-      const nextLinks = streamNextLinks.length > 0 ?
-        streamNextLinks :
-        getMetadataNextLinks(result?.metadata);
+      const nextLinks = streamNextLinks.length > 0 ? streamNextLinks : getMetadataNextLinks(sourceResult.metadata);
       for (const link of nextLinks) {
         if (!seenLinks.has(link) && !isDatasetPageLink(link, this.originalSourceUrl)) {
           queuedLinks.push(link);
@@ -609,19 +641,14 @@ export class QuerySourceSmartKg implements IQuerySource {
   private async fetchPartitionFile(family: ISmartKgFamily): Promise<string> {
     const partitionUrl = `${this.partitionsBaseUrl}/${family.name}`;
     const partitionPath = join(this.cacheFolder, encodeURIComponent(partitionUrl));
-    if (existsSync(partitionPath)) {
+    if (existsSync(partitionPath) && isHdtBuffer(readFileSync(partitionPath))) {
       return partitionPath;
     }
 
     const response = await this.mediatorHttp.mediate({ context: this.defaultContext, input: partitionUrl });
     const body = ActorHttp.toNodeReadable(response.body);
-    await new Promise<void>((resolve, reject) => {
-      const output = createWriteStream(partitionPath);
-      body.pipe(output);
-      output.on('finish', () => resolve());
-      output.on('error', reject);
-      body.on('error', reject);
-    });
+    const payload = await readStreamToBuffer(body);
+    writePartitionPayload(partitionPath, payload);
     return partitionPath;
   }
 
@@ -940,6 +967,31 @@ function selectCompatibleStarFamilies(patterns: Algebra.Pattern[], metadata: ISm
   return deduplicateFamilies([ ...minimalSupersets, ...maximalSubsets ]);
 }
 
+function sortPatternsByEstimatedPartitionSize(
+  patterns: Algebra.Pattern[],
+  metadata: ISmartKgMetadata,
+): Algebra.Pattern[] {
+  return [ ...patterns ].sort((left, right) =>
+    getPatternEstimatedPartitionSize(left, metadata) - getPatternEstimatedPartitionSize(right, metadata));
+}
+
+function getPatternEstimatedPartitionSize(pattern: Algebra.Pattern, metadata: ISmartKgMetadata): number {
+  if (pattern.predicate.termType === 'Variable') {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  const predicate = termToString(pattern.predicate);
+  let totalTriples = 0;
+  let matchingFamilies = 0;
+  for (const family of metadata.families) {
+    if (family.predicateSet?.includes(predicate)) {
+      matchingFamilies++;
+      totalTriples += family.numTriples;
+    }
+  }
+  return matchingFamilies === 0 ? Number.POSITIVE_INFINITY : totalTriples;
+}
+
 function selectStarScopedMaterializedFamilies(
   patterns: Algebra.Pattern[],
   candidateFamilies: ISmartKgFamily[],
@@ -967,6 +1019,10 @@ function selectStarScopedMaterializedFamilies(
 
 function isPatternPredicateContainedInSet(pattern: Algebra.Pattern, predicates: Set<string>): boolean {
   return pattern.predicate.termType !== 'Variable' && predicates.has(termToString(pattern.predicate));
+}
+
+function hasPredicate(pattern: Algebra.Pattern, predicate: string): boolean {
+  return pattern.predicate.termType !== 'Variable' && termToString(pattern.predicate) === predicate;
 }
 
 function patternToKey(pattern: Algebra.Pattern): string {
@@ -1039,6 +1095,68 @@ async function readStreamToString(stream: NodeJS.ReadableStream): Promise<string
     chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
   }
   return Buffer.concat(chunks).toString('utf8');
+}
+
+async function readStreamToBuffer(stream: NodeJS.ReadableStream): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream as any as AsyncIterable<Buffer | string>) {
+    chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+function writePartitionPayload(partitionPath: string, payload: Buffer): void {
+  if (isHdtBuffer(payload)) {
+    writeFileSync(partitionPath, payload);
+    return;
+  }
+
+  const entries = extractTarEntries(payload);
+  const hdtEntry = entries.find(entry => entry.name.endsWith('.hdt') && !entry.name.endsWith('.index.v1-1'));
+  if (!hdtEntry) {
+    writeFileSync(partitionPath, payload);
+    return;
+  }
+
+  writeFileSync(partitionPath, hdtEntry.payload);
+  const indexEntry = entries.find(entry => entry.name === `${hdtEntry.name}.index.v1-1`);
+  if (indexEntry) {
+    writeFileSync(`${partitionPath}.index.v1-1`, indexEntry.payload);
+  }
+}
+
+function isHdtBuffer(buffer: Buffer): boolean {
+  return buffer.subarray(0, 4).toString('utf8') === '$HDT';
+}
+
+function extractTarEntries(buffer: Buffer): { name: string; payload: Buffer }[] {
+  const entries: { name: string; payload: Buffer }[] = [];
+  let offset = 0;
+
+  while (offset + 512 <= buffer.length) {
+    const header = buffer.subarray(offset, offset + 512);
+    if (header.every(byte => byte === 0)) {
+      break;
+    }
+
+    const name = header.subarray(0, 100).toString('utf8').replace(/\0.*$/u, '');
+    const sizeText = header.subarray(124, 136).toString('utf8').replace(/\0.*$/u, '').trim();
+    const size = Number.parseInt(sizeText, 8);
+    if (!name || !Number.isFinite(size) || size < 0) {
+      break;
+    }
+
+    const payloadStart = offset + 512;
+    const payloadEnd = payloadStart + size;
+    if (payloadEnd > buffer.length) {
+      break;
+    }
+
+    entries.push({ name, payload: buffer.subarray(payloadStart, payloadEnd) });
+    offset = payloadStart + Math.ceil(size / 512) * 512;
+  }
+
+  return entries;
 }
 
 async function readFileUtf8(path: string): Promise<string> {

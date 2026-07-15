@@ -188,18 +188,23 @@ export class QuerySourcePassage implements IQuerySource {
     }
 
     this.lastSourceContext = this.context.merge(context);
-    const rawStream = await this.endpointFetcher.fetchBindings(endpoint, query)
-      .then((stream) => {
-        QuerySourcePassage.updateFirstResultTime(context, operation);
-        return stream;
-      })
-      .catch((error: Error) => {
-        QuerySourcePassage.logError(context, operation, error.message);
-      });
-    this.lastSourceContext = undefined;
+    let rawStream;
+    try {
+      rawStream = await this.endpointFetcher.fetchBindings(endpoint, query)
+        .then((stream) => {
+          QuerySourcePassage.updateFirstResultTime(context, operation);
+          return stream;
+        })
+        .catch((error: Error) => {
+          QuerySourcePassage.logError(context, operation, error.message);
+          throw error;
+        });
+    } finally {
+      this.lastSourceContext = undefined;
+    }
 
     if (!rawStream) {
-      return new EmptyIterator<RDF.Bindings>() as BindingsStream;
+      throw new Error(`The Passage endpoint ${endpoint} did not return a bindings stream.`);
     }
 
     const iterator = wrap<any>(rawStream, { autoStart: false, maxBufferSize: Number.POSITIVE_INFINITY })
@@ -221,7 +226,7 @@ export class QuerySourcePassage implements IQuerySource {
         );
       });
 
-    const nextPromise: Promise<string | void> = new Promise(resolve => {
+    const nextPromise: Promise<string | void> = new Promise((resolve, reject) => {
       rawStream.on('metadata', async(metadata: { next?: string }) => {
         if (metadata.next) {
           Actor.getContextLogger(this.context)?.info(`Next query to get complete result:\n${metadata.next}`, {});
@@ -233,7 +238,7 @@ export class QuerySourcePassage implements IQuerySource {
       });
       iterator.on('error', async(error: Error) => {
         QuerySourcePassage.logError(context, operation, error.message);
-        resolve();
+        reject(error);
       });
       iterator.on('end', async() => {
         QuerySourcePassage.updateDoneTime(context, operation);

@@ -29,7 +29,7 @@ export class ActorQuerySourceIdentifyHypermediaSmartKg extends ActorQuerySourceI
       return failTest(`Actor ${this.name} ignores SmartKG fallback delegation contexts.`);
     }
 
-    if (action.forceSourceType && action.forceSourceType !== 'smartkg') {
+    if (action.forceSourceType && action.forceSourceType !== 'smartkg' && action.forceSourceType !== 'smartkg+') {
       return failTest(`Actor ${this.name} is not able to handle source type ${action.forceSourceType}.`);
     }
     return this.testMetadata(action);
@@ -42,7 +42,7 @@ export class ActorQuerySourceIdentifyHypermediaSmartKg extends ActorQuerySourceI
       return failTest(`Actor ${this.name} ignores SmartKG fallback delegation contexts.`);
     }
 
-    if (action.forceSourceType === 'smartkg') {
+    if (action.forceSourceType === 'smartkg' || action.forceSourceType === 'smartkg+') {
       return passTest({ filterFactor: 2 });
     }
 
@@ -86,10 +86,15 @@ function clearPageLinks(metadata: Record<string, unknown>): void {
 function isRootSmartKgUrl(url: string): boolean {
   try {
     const parsedUrl = new URL(url);
-    return !parsedUrl.search && parsedUrl.pathname.replace(/\/$/u, '').toLowerCase().endsWith('/smartkg');
+    return !parsedUrl.search && isSmartKgDatasetPath(parsedUrl.pathname);
   } catch {
-    return url.replace(/\/$/u, '').toLowerCase().endsWith('/smartkg') && !url.includes('?');
+    return isSmartKgDatasetPath(url) && !url.includes('?');
   }
+}
+
+function isSmartKgDatasetPath(path: string): boolean {
+  const normalizedPath = path.replace(/\/$/u, '').toLowerCase();
+  return normalizedPath.endsWith('/smartkg');
 }
 
 function isContextFlagSet(context: unknown, key: string): boolean {

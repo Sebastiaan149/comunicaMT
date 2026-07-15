@@ -12,14 +12,14 @@ import type { MediatorRdfMetadataExtract } from '@comunica/bus-rdf-metadata-extr
 import { KeysInitQuery } from '@comunica/context-entries';
 import type { TestResult } from '@comunica/core';
 import { failTest, passTest } from '@comunica/core';
+import type { ComunicaDataFactory, IActionContext } from '@comunica/types';
+import { AlgebraFactory } from '@comunica/utils-algebra';
+import { BindingsFactory } from '@comunica/utils-bindings-factory';
 import {
   createSpfSearchForm,
   detectSpfSearchForm,
   QuerySourceSpf,
-} from '@comunica/query-source-spf';
-import type { ComunicaDataFactory, IActionContext } from '@comunica/types';
-import { AlgebraFactory } from '@comunica/utils-algebra';
-import { BindingsFactory } from '@comunica/utils-bindings-factory';
+} from './QuerySourceSpf';
 
 /**
  * Identifies hypermedia sources that expose an SPF Hydra search control.

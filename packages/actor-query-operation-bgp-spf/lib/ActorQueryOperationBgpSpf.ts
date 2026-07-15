@@ -2,7 +2,7 @@ import type { IActorQueryOperationArgs } from '@comunica/bus-query-operation';
 import { ActorQueryOperationTyped } from '@comunica/bus-query-operation';
 import type { IActorTest, TestResult } from '@comunica/core';
 import { failTest, passTest } from '@comunica/core';
-import { isQuerySourceSpf } from '@comunica/query-source-spf';
+import { isQuerySourceSpf } from '@comunica/actor-query-source-identify-hypermedia-spf';
 import type { IActionContext, IQueryOperationResult, IQuerySourceWrapper } from '@comunica/types';
 import { Algebra } from '@comunica/utils-algebra';
 import { getMetadataBindings } from '@comunica/utils-metadata';

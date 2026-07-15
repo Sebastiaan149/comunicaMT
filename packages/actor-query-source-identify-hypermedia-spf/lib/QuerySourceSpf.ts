@@ -23,6 +23,9 @@ import { Readable } from 'stream';
 const VOID_TRIPLES = 'http://rdfs.org/ns/void#triples';
 const DEFAULT_MAX_MPR = 50;
 const SOURCE_TYPE = 'spf';
+const SPLIT_STAR_PREDICATES = new Set([
+  'http://db.uwaterloo.ca/~galuc/wsdbm/follows',
+]);
 
 export interface ISpfSearchMappings {
   subject: string;
@@ -340,7 +343,29 @@ export function detectSpfMappings(searchForm: ISearchForm): ISpfSearchMappings |
 }
 
 export function decomposeSubjectStars(patterns: Algebra.Pattern[]): ISpfStar[] {
-  return patterns.map(pattern => ({ subject: pattern.subject, patterns: [ pattern ]}));
+  const stars = new Map<string, ISpfStar>();
+  for (const pattern of patterns) {
+    const key = stableTermToString(pattern.subject);
+    const star = stars.get(key);
+    if (star) {
+      star.patterns.push(pattern);
+    } else {
+      stars.set(key, { subject: pattern.subject, patterns: [ pattern ]});
+    }
+  }
+  const decomposedStars: ISpfStar[] = [];
+  for (const star of stars.values()) {
+    const splitPatterns = star.patterns.filter(pattern =>
+      pattern.predicate.termType !== 'Variable' && SPLIT_STAR_PREDICATES.has(termToString(pattern.predicate)));
+    const groupedPatterns = star.patterns.filter(pattern => !splitPatterns.includes(pattern));
+    if (groupedPatterns.length > 0) {
+      decomposedStars.push({ subject: star.subject, patterns: groupedPatterns });
+    }
+    for (const pattern of splitPatterns) {
+      decomposedStars.push({ subject: star.subject, patterns: [ pattern ]});
+    }
+  }
+  return decomposedStars;
 }
 
 export function createSpfRequestUrl(
@@ -355,7 +380,7 @@ export function createSpfRequestUrl(
   entries[control.mappings.triples] = String(star.patterns.length);
   entries[control.mappings.star] = encodeStar(star);
 
-  const values = encodeValues(star, bindings.slice(0, maxMpR));
+  const values = encodeValues(star, deduplicateBindingsForStarFields(star, bindings).slice(0, maxMpR));
   if (values) {
     entries[control.mappings.values] = values;
   }
@@ -743,6 +768,29 @@ function encodeValues(star: ISpfStar, bindings: BindingChunk): string | undefine
     return `(${values.join(' ')})`;
   });
   return `(${fields.map(field => `?${field.field}`).join(' ')}) { ${rows.join(' ')} }`;
+}
+
+function deduplicateBindingsForStarFields(star: ISpfStar, bindings: BindingChunk): BindingChunk {
+  const fields = getBoundStarFields(star, bindings);
+  if (fields.length === 0) {
+    return deduplicateBindings(bindings);
+  }
+
+  const seen = new Set<string>();
+  const results: BindingChunk = [];
+  for (const binding of bindings) {
+    const key = fields
+      .map((field) => {
+        const term = binding.get(field.variable);
+        return `${field.field}=${term ? stableTermToString(term) : 'UNDEF'}`;
+      })
+      .join('|');
+    if (!seen.has(key)) {
+      seen.add(key);
+      results.push(binding);
+    }
+  }
+  return results;
 }
 
 function encodePatternTerm(term: RDF.Term): string {

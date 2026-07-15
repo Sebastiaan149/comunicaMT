@@ -42,9 +42,9 @@
     "build:components": "componentsjs-generator"
   },
   "dependencies": {
+    "@comunica/actor-query-source-identify-hypermedia-spf": "^5.1.3",
     "@comunica/bus-query-operation": "^5.1.3",
     "@comunica/core": "^5.1.3",
-    "@comunica/query-source-spf": "^5.1.3",
     "@comunica/types": "^5.1.3",
     "@comunica/utils-algebra": "^5.1.3",
     "@comunica/utils-metadata": "^5.1.3",

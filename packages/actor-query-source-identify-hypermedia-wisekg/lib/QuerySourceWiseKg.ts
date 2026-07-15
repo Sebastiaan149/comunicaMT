@@ -257,7 +257,7 @@ export class QuerySourceWiseKg implements IQuerySource {
       return this.executeWiseKgPlan(bgp.patterns, fetchedPlan, context, options);
     }
 
-    return this.evaluateBgpWithoutPlan(bgp.patterns, context, options);
+    throw new Error('WiseKG did not return an executable plan for the BGP.');
   }
 
   private async evaluatePatternsByPlan(
@@ -271,31 +271,7 @@ export class QuerySourceWiseKg implements IQuerySource {
       return this.executeWiseKgPlan(patterns, fetchedPlan, context, options);
     }
 
-    return this.evaluateBgpWithoutPlan(patterns, context, options);
-  }
-
-  private async evaluateBgpWithoutPlan(
-    patterns: Algebra.Pattern[],
-    context: IActionContext,
-    options?: IQueryBindingsOptions,
-  ): Promise<RDF.Bindings[]> {
-    const stars = new Map<string, Algebra.Pattern[]>();
-    for (const pattern of patterns) {
-      const subject = termToString(pattern.subject);
-      const bucket = stars.get(subject) ?? [];
-      bucket.push(pattern);
-      stars.set(subject, bucket);
-    }
-
-    let results: RDF.Bindings[] = [ await this.emptyBinding() ];
-    for (const starPatterns of stars.values()) {
-      const starResults = await this.queryStarViaOriginalSource(starPatterns, context, options);
-      results = await this.joinBindingsLists(results, starResults);
-      if (results.length === 0) {
-        break;
-      }
-    }
-    return this.deduplicateBindings(results);
+    throw new Error('WiseKG did not return an executable plan for the join.');
   }
 
   private async fetchWiseKgPlan(
@@ -429,14 +405,8 @@ export class QuerySourceWiseKg implements IQuerySource {
       const partitionPath = await this.fetchPartitionFileByControl(step.control);
       const localResults = await this.evaluatePatternsOnPartition(partitionPath, starPatterns);
       const sourceResults = await this.queryStarViaOriginalSourceWithRetry(starPatterns, context, options);
-      if (sourceResults.length > localResults.length) {
-        this.logDebug(
-          context,
-          `WiseKG partition ${step.control} produced ${localResults.length} row(s); original source produced ${sourceResults.length}. Using original-source rows for completeness.`,
-        );
-        return this.deduplicateBindings(await this.joinBindingsLists(inputBindings, sourceResults));
-      }
-      return this.deduplicateBindings(await this.joinBindingsLists(inputBindings, localResults));
+      const stepResults = sourceResults.length > localResults.length ? sourceResults : localResults;
+      return this.deduplicateBindings(await this.joinBindingsLists(inputBindings, stepResults));
     }
 
     if (this.isOriginalSourceControl(step.control)) {
@@ -445,9 +415,7 @@ export class QuerySourceWiseKg implements IQuerySource {
       return this.deduplicateBindings(await this.joinBindingsLists(inputBindings, sourceResults));
     }
 
-    this.logDebug(context, `WiseKG encountered unknown control '${step.control}'; using original-source fallback.`);
-    const fallbackResults = await this.queryStarViaOriginalSourceWithRetry(starPatterns, context, options);
-    return this.deduplicateBindings(await this.joinBindingsLists(inputBindings, fallbackResults));
+    throw new Error(`WiseKG encountered unsupported plan control '${step.control}'.`);
   }
 
   private wiseKgStarToPatterns(star: IWiseKgPlanStar): Algebra.Pattern[] {

@@ -18,6 +18,7 @@ export class ActorQueryOperationBgpWiseKg extends ActorQueryOperationTypedMediat
     super(args, 'bgp');
   }
 
+  // Avoid repeatedly marking the same WiseKG BGP during delegated execution.
   public async testOperation(
     _operation: Algebra.Bgp,
     context: IActionContext,
@@ -28,14 +29,15 @@ export class ActorQueryOperationBgpWiseKg extends ActorQueryOperationTypedMediat
     return passTestVoid();
   }
 
+  // Mark the BGP as handled and then delegate to the configured mediator.
   public async runOperation(
     operation: Algebra.Bgp,
     context: IActionContext,
   ): Promise<IQueryOperationResult> {
     let nextContext = context;
 
-    if (typeof (nextContext as any).setRaw === 'function') {
-      nextContext = (nextContext as any).setRaw(KEY_CONTEXT_WISEKG_BGP_HANDLED, true);
+    if (typeof (<any> nextContext).setRaw === 'function') {
+      nextContext = (<any> nextContext).setRaw(KEY_CONTEXT_WISEKG_BGP_HANDLED, true);
     }
 
     return this.mediatorQueryOperation.mediate({
@@ -45,19 +47,20 @@ export class ActorQueryOperationBgpWiseKg extends ActorQueryOperationTypedMediat
   }
 }
 
+// Read context flags from both Comunica ActionContext and plain objects.
 function isContextFlagSet(context: unknown, key: string): boolean {
   if (!context) {
     return false;
   }
 
-  const rawValue = typeof (context as any).getRaw === 'function' ?
-    (context as any).getRaw(key) :
+  const rawValue = typeof (<any> context).getRaw === 'function' ?
+      (<any> context).getRaw(key) :
     undefined;
   if (rawValue !== undefined) {
     return Boolean(rawValue);
   }
 
-  return Boolean((context as Record<string, unknown>)[key]);
+  return Boolean((<Record<string, unknown>> context)[key]);
 }
 
 export interface IActorQueryOperationBgpWiseKgArgs extends IActorQueryOperationTypedMediatedArgs {}

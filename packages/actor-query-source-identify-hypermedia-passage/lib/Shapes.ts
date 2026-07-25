@@ -1,13 +1,12 @@
 import type { FragmentSelectorShape } from '@comunica/types';
 import { Algebra } from '@comunica/utils-algebra';
 
-
 /**
  * Passage handles its own set of operators that is subset of SPARQL 1.1.
  * But it can also emulate other approaches such as TPF, and BRTPF.
  */
+// eslint-disable-next-line ts/no-extraneous-class
 export class Shapes {
-
   // Only triple pattern are handled. Pagination is done by using
   // SLICE, i.e., OFFSET.
   public static readonly TPF: FragmentSelectorShape = {
@@ -19,18 +18,21 @@ export class Shapes {
       {
         type: 'operation',
         operation: { operationType: 'type', type: Algebra.Types.PROJECT },
-      }, { // The least a server can do is being able to process a triple pattern
+      },
+      // The least a server can do is being able to process a triple pattern
+      {
         type: 'operation',
         operation: { operationType: 'type', type: Algebra.Types.PATTERN },
-        // joinBindings: true,
+        // JoinBindings: true,
         // filterBindings: true,
-      }, { // We make heavy use of OFFSET in continuation queries
+      },
+      // We make heavy use of OFFSET in continuation queries
+      {
         type: 'operation',
-        operation: { operationType: 'type', type: Algebra.Types.SLICE }
-      }
-    ]
+        operation: { operationType: 'type', type: Algebra.Types.SLICE },
+      },
+    ],
   };
-
 
   public static readonly BRTPF: FragmentSelectorShape = {
     type: 'disjunction',
@@ -38,18 +40,22 @@ export class Shapes {
       {
         type: 'operation',
         operation: { operationType: 'type', type: Algebra.Types.PROJECT },
-      }, { // The least a server can do is being able to process a triple pattern
+      },
+      // The least a server can do is being able to process a triple pattern
+      {
         type: 'operation',
         operation: { operationType: 'type', type: Algebra.Types.PATTERN },
         joinBindings: true,
-        filterBindings: true, // actually inject bindings
-      }, { // We make heavy use of OFFSET in continuation queries
+        // Actually inject bindings
+        filterBindings: true,
+      },
+      // We make heavy use of OFFSET in continuation queries
+      {
         type: 'operation',
         operation: { operationType: 'type', type: Algebra.Types.SLICE },
       },
-    ]
-  }; 
-
+    ],
+  };
 
   public static readonly PASSAGE: FragmentSelectorShape = {
     type: 'disjunction',
@@ -57,30 +63,41 @@ export class Shapes {
       {
         type: 'operation',
         operation: { operationType: 'type', type: Algebra.Types.PROJECT },
-      }, { // The least a server can do is being able to process a triple pattern
+      },
+      // The least a server can do is being able to process a triple pattern
+      {
         type: 'operation',
         operation: { operationType: 'type', type: Algebra.Types.PATTERN },
-        // joinBindings: true,
+        // JoinBindings: true,
         // filterBindings: true,
-      }, { // We make heavy use of OFFSET in continuation queries
+      },
+      // We make heavy use of OFFSET in continuation queries
+      {
         type: 'operation',
         operation: { operationType: 'type', type: Algebra.Types.SLICE },
       },
-      { // BGP are easy to handle
+      // BGP are easy to handle
+      {
         type: 'operation',
         operation: { operationType: 'type', type: Algebra.Types.BGP },
-      }, { // Join and BGP are alike
+      },
+      // Join and BGP are alike
+      {
         type: 'operation',
         operation: { operationType: 'type', type: Algebra.Types.JOIN },
-      }, { // Bind are used to encode the context of execution
+      },
+      // Bind are used to encode the context of execution
+      {
         type: 'operation',
         operation: { operationType: 'type', type: Algebra.Types.EXTEND },
       },
-      { // Union can be on server or not
+      // Union can be on server or not
+      {
         type: 'operation',
         operation: { operationType: 'type', type: Algebra.Types.UNION },
       },
-      { // TODO server must handle VALUES if they want to use binding-restricted
+      // TODO server must handle VALUES if they want to use binding-restricted
+      {
         type: 'operation',
         operation: { operationType: 'type', type: Algebra.Types.VALUES },
       },
@@ -96,29 +113,37 @@ export class Shapes {
     ],
   };
 
-
   public static readonly PASSAGE_NO_UNION: FragmentSelectorShape = {
     type: 'disjunction',
     children: [
       {
         type: 'operation',
         operation: { operationType: 'type', type: Algebra.Types.PROJECT },
-      }, { // The least a server can do is being able to process a triple pattern
+      },
+      // The least a server can do is being able to process a triple pattern
+      {
         type: 'operation',
         operation: { operationType: 'type', type: Algebra.Types.PATTERN },
-        // joinBindings: true,
+        // JoinBindings: true,
         // filterBindings: true,
-      }, { // We make heavy use of OFFSET in continuation queries
+      },
+      // We make heavy use of OFFSET in continuation queries
+      {
         type: 'operation',
         operation: { operationType: 'type', type: Algebra.Types.SLICE },
       },
-      { // BGP are easy to handle
+      // BGP are easy to handle
+      {
         type: 'operation',
         operation: { operationType: 'type', type: Algebra.Types.BGP },
-      }, { // Join and BGP are alike
+      },
+      // Join and BGP are alike
+      {
         type: 'operation',
         operation: { operationType: 'type', type: Algebra.Types.JOIN },
-      }, { // Bind are used to encode the context of execution
+      },
+      // Bind are used to encode the context of execution
+      {
         type: 'operation',
         operation: { operationType: 'type', type: Algebra.Types.EXTEND },
       },
@@ -132,5 +157,4 @@ export class Shapes {
       },
     ],
   };
-
 }

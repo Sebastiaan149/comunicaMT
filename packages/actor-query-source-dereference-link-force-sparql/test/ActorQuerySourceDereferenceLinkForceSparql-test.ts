@@ -70,7 +70,7 @@ describe('ActorQuerySourceDereferenceLinkForceSparql', () => {
           link: { url: 'URL', forceSourceType: 'sparql' },
           context: new ActionContext()
             .set(KeysQueryOperation.querySources, [ <any> 'abc', 'def' ]),
-        })).resolves.toFailTest('actor can only handle a single forced SPARQL source');
+        })).resolves.toFailTest('actor can only handle a single forced SPARQL or Passage source');
       });
 
       it('should not pass for a file source', async() => {
@@ -78,7 +78,7 @@ describe('ActorQuerySourceDereferenceLinkForceSparql', () => {
           link: { url: 'URL', forceSourceType: 'file' },
           context: new ActionContext()
             .set(KeysQueryOperation.querySources, [ <any> 'abc' ]),
-        })).resolves.toFailTest('actor can only handle a single forced SPARQL source');
+        })).resolves.toFailTest('actor can only handle a single forced SPARQL or Passage source');
       });
     });
 

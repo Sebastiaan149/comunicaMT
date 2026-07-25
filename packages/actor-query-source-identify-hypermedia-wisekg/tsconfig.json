@@ -1,10 +1,10 @@
 {
   "extends": "../../tsconfig.json",
   "compilerOptions": {
-    "outDir": "lib",
+    "tsBuildInfoFile": "lib/.tsbuildinfo",
     "rootDir": "lib",
-    "skipLibCheck": true,
-    "tsBuildInfoFile": "lib/.tsbuildinfo"
+    "outDir": "lib",
+    "skipLibCheck": true
   },
   "include": [
     "lib"

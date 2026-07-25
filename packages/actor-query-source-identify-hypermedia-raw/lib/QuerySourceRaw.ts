@@ -1,7 +1,7 @@
-import type { MediatorHttp } from '@comunica/bus-http';
-import type { MediatorQuerySerialize } from '@comunica/bus-query-serialize';
 import type { BindMethod } from '@comunica/actor-query-source-identify-hypermedia-sparql';
 import { QuerySourceSparql } from '@comunica/actor-query-source-identify-hypermedia-sparql';
+import type { MediatorHttp } from '@comunica/bus-http';
+import type { MediatorQuerySerialize } from '@comunica/bus-query-serialize';
 import { KeysInitQuery } from '@comunica/context-entries';
 import { ActionContextKey, Actor } from '@comunica/core';
 import type {
@@ -129,21 +129,13 @@ export class QuerySourceRaw implements IQuerySource {
     operationPromise: Promise<Algebra.Operation>,
     options?: IQueryBindingsOptions,
   ): void {
-    let variablesCount: MetadataVariable[] = [];
-    new Promise<Algebra.Operation>(async(resolve, reject) => {
-      try {
-        const operation = await operationPromise;
-        const undefVariables = QuerySourceSparql.getOperationUndefs(operation);
-        const variablesScoped = algebraUtils.inScopeVariables(operation);
-        variablesCount = variablesScoped.map(variable => ({
-          variable,
-          canBeUndef: undefVariables.some(undefVariable => undefVariable.equals(variable)),
-        }));
-        resolve(operation);
-      } catch (error: unknown) {
-        reject(error);
-      }
-    }).then(async(operation) => {
+    operationPromise.then(async(operation) => {
+      const undefVariables = QuerySourceSparql.getOperationUndefs(operation);
+      const variablesScoped = algebraUtils.inScopeVariables(operation);
+      const variablesCount: MetadataVariable[] = variablesScoped.map(variable => ({
+        variable,
+        canBeUndef: undefVariables.some(undefVariable => undefVariable.equals(variable)),
+      }));
       const selectQuery = await this.toSelectQuery(context, operation, options);
 
       target.setProperty('metadata', {
@@ -175,7 +167,7 @@ export class QuerySourceRaw implements IQuerySource {
 
     const iterator = wrap<any>(rawStream, { autoStart: false, maxBufferSize: Number.POSITIVE_INFINITY })
       .map<RDF.Bindings>((rawData: Record<string, RDF.Term>) => {
-        const nbResults: number = iterator.getProperty('nbResults') || 0;
+        const nbResults: number = iterator.getProperty('nbResults') ?? 0;
         iterator.setProperty('nbResults', nbResults + 1);
 
         return this.bindingsFactory.bindings(
@@ -192,9 +184,9 @@ export class QuerySourceRaw implements IQuerySource {
         );
       });
 
-    iterator.on('end', async() => {
+    iterator.on('end', () => {
       QuerySourceRaw.updateDoneTime(context, operation);
-      QuerySourceRaw.updateNbResults(context, operation, iterator.getProperty('nbResults') || 0);
+      QuerySourceRaw.updateNbResults(context, operation, iterator.getProperty('nbResults') ?? 0);
     });
 
     return iterator;
@@ -269,7 +261,7 @@ export class QuerySourceRaw implements IQuerySource {
   public static updateStartTime(context: IActionContext, operation: Algebra.Operation): void {
     const physicalQueryPlanLogger = QuerySourceRaw.getPhysicalQueryPlanLogger(context);
     if (physicalQueryPlanLogger) {
-      const node = operation as Record<string, any>;
+      const node = <Record<string, any>> operation;
       node.startAt = Date.now();
       physicalQueryPlanLogger.appendMetadata(operation, { startAt: node.startAt });
     }
@@ -278,7 +270,7 @@ export class QuerySourceRaw implements IQuerySource {
   public static updateDoneTime(context: IActionContext, operation: Algebra.Operation): void {
     const physicalQueryPlanLogger = QuerySourceRaw.getPhysicalQueryPlanLogger(context);
     if (physicalQueryPlanLogger) {
-      const node = operation as Record<string, any>;
+      const node = <Record<string, any>> operation;
       node.doneAt = Date.now();
       node.timeLife = node.doneAt - node.startAt;
       physicalQueryPlanLogger.appendMetadata(operation, { doneAt: node.doneAt });
@@ -289,7 +281,7 @@ export class QuerySourceRaw implements IQuerySource {
   public static updateNbResults(context: IActionContext, operation: Algebra.Operation, nbResults: number): void {
     const physicalQueryPlanLogger = QuerySourceRaw.getPhysicalQueryPlanLogger(context);
     if (physicalQueryPlanLogger) {
-      const node = operation as Record<string, any>;
+      const node = <Record<string, any>> operation;
       node.cardinalityReal = nbResults;
       physicalQueryPlanLogger.appendMetadata(operation, { cardinalityReal: nbResults });
     }

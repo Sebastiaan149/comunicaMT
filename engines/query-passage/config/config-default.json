@@ -3,6 +3,6 @@
     "https://linkedsoftwaredependencies.org/bundles/npm/@comunica/config-query-passage/^5.0.0/components/context.jsonld"
   ],
   "import": [
-      "ccqp:config/config-default.json"
+    "ccqp:config/config-default.json"
   ]
 }

@@ -41,6 +41,7 @@ export class ActorQuerySourceIdentifyHypermediaSpf extends ActorQuerySourceIdent
     this.maxMpR = args.maxMpR ?? 50;
   }
 
+  // Accept forced SPF sources or metadata that exposes an SPF control.
   public override async test(
     action: IActionQuerySourceIdentifyHypermedia,
   ): Promise<TestResult<IActorQuerySourceIdentifyHypermediaTest>> {
@@ -50,6 +51,7 @@ export class ActorQuerySourceIdentifyHypermediaSpf extends ActorQuerySourceIdent
     return this.testMetadata(action);
   }
 
+  // Validate the Hydra form fields needed for SPF requests.
   public async testMetadata(
     action: IActionQuerySourceIdentifyHypermedia,
   ): Promise<TestResult<IActorQuerySourceIdentifyHypermediaTest>> {
@@ -66,6 +68,7 @@ export class ActorQuerySourceIdentifyHypermediaSpf extends ActorQuerySourceIdent
     return passTest({ filterFactor: 1 });
   }
 
+  // Create the SPF query source for the detected dataset.
   public async run(
     action: IActionQuerySourceIdentifyHypermedia,
   ): Promise<IActorQuerySourceIdentifyHypermediaOutput> {
@@ -73,6 +76,7 @@ export class ActorQuerySourceIdentifyHypermediaSpf extends ActorQuerySourceIdent
     return { source, dataset: source.searchForm.dataset };
   }
 
+  // Assemble the query-source dependencies from Comunica mediators.
   protected async createSource(
     url: string,
     metadata: Record<string, any>,

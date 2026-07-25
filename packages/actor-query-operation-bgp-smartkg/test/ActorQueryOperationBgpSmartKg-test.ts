@@ -1,3 +1,4 @@
+import { Bus } from '@comunica/core';
 import { ActorQueryOperationBgpSmartKg } from '../lib';
 
 describe('ActorQueryOperationBgpSmartKg', () => {
@@ -13,8 +14,8 @@ describe('ActorQueryOperationBgpSmartKg', () => {
     beforeEach(() => {
       actor = new ActorQueryOperationBgpSmartKg({
         name: 'test-bgp-smartkg',
-        bus: {} as any,
-        mediatorQueryOperation: {} as any,
+        bus: new Bus({ name: 'bus' }),
+        mediatorQueryOperation: <any> {},
       });
     });
 

@@ -1,65 +1,73 @@
 import type { FragmentSelectorShape } from '@comunica/types';
 import { Algebra } from '@comunica/utils-algebra';
 
-
 /**
  * Raw handles its own set of operators that is subset of SPARQL 1.1.
  */
+// eslint-disable-next-line ts/no-extraneous-class
 export class Shapes {
+  /** For now, we accept everything */
+  public static readonly ALL: FragmentSelectorShape = {
+    type: 'operation',
+    operation: { operationType: 'wildcard' },
+  };
 
-    /** For now, we accept everything **/
-    public static readonly ALL: FragmentSelectorShape = {
+  public static readonly RAW: FragmentSelectorShape = {
+    type: 'disjunction',
+    children: [
+      {
         type: 'operation',
-        operation: {operationType: 'wildcard'}
-    };
-
-    public static readonly RAW: FragmentSelectorShape = {
-        type: 'disjunction',
-        children: [
-            {
-                type: 'operation',
-                operation: { operationType: 'type', type: Algebra.Types.PROJECT },
-            }, { // The least a server can do is being able to process a triple pattern
-                type: 'operation',
-                operation: { operationType: 'type', type: Algebra.Types.PATTERN },
-                // joinBindings: true,
-                // filterBindings: true,
-            }, { // We make heavy use of OFFSET in continuation queries
-                type: 'operation',
-                operation: { operationType: 'type', type: Algebra.Types.SLICE },
-            },
-            { // BGP are easy to handle
-                type: 'operation',
-                operation: { operationType: 'type', type: Algebra.Types.BGP },
-            }, { // Join and BGP are alike
-                type: 'operation',
-                operation: { operationType: 'type', type: Algebra.Types.JOIN },
-            }, { // Bind are used to encode the context of execution
-                type: 'operation',
-                operation: { operationType: 'type', type: Algebra.Types.EXTEND },
-            },
-            { // Union can be on server or not
-                type: 'operation',
-                operation: { operationType: 'type', type: Algebra.Types.UNION },
-            },
-            { // TODO server must handle VALUES if they want to use binding-restricted
-                 type: 'operation',
-                 operation: { operationType: 'type', type: Algebra.Types.VALUES },
-            },
-            {
-                type: 'operation',
-                operation: { operationType: 'type', type: Algebra.Types.FILTER },
-            },
-            {
-                type: 'operation',
-                operation: { operationType: 'type', type: Algebra.Types.LEFT_JOIN },
-            },
-            {
-                type: 'operation',
-                operation: { operationType: 'type', type: Algebra.Types.GRAPH }
-            },
-
-        ],
-    };
-
+        operation: { operationType: 'type', type: Algebra.Types.PROJECT },
+      },
+      // The least a server can do is being able to process a triple pattern
+      {
+        type: 'operation',
+        operation: { operationType: 'type', type: Algebra.Types.PATTERN },
+        // JoinBindings: true,
+        // filterBindings: true,
+      },
+      // We make heavy use of OFFSET in continuation queries
+      {
+        type: 'operation',
+        operation: { operationType: 'type', type: Algebra.Types.SLICE },
+      },
+      // BGP are easy to handle
+      {
+        type: 'operation',
+        operation: { operationType: 'type', type: Algebra.Types.BGP },
+      },
+      // Join and BGP are alike
+      {
+        type: 'operation',
+        operation: { operationType: 'type', type: Algebra.Types.JOIN },
+      },
+      // Bind are used to encode the context of execution
+      {
+        type: 'operation',
+        operation: { operationType: 'type', type: Algebra.Types.EXTEND },
+      },
+      // Union can be on server or not
+      {
+        type: 'operation',
+        operation: { operationType: 'type', type: Algebra.Types.UNION },
+      },
+      // TODO server must handle VALUES if they want to use binding-restricted
+      {
+        type: 'operation',
+        operation: { operationType: 'type', type: Algebra.Types.VALUES },
+      },
+      {
+        type: 'operation',
+        operation: { operationType: 'type', type: Algebra.Types.FILTER },
+      },
+      {
+        type: 'operation',
+        operation: { operationType: 'type', type: Algebra.Types.LEFT_JOIN },
+      },
+      {
+        type: 'operation',
+        operation: { operationType: 'type', type: Algebra.Types.GRAPH },
+      },
+    ],
+  };
 }

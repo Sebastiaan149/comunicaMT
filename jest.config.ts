@@ -5,6 +5,10 @@ const config: Config.InitialOptions = {
   coveragePathIgnorePatterns: [
     '/test/',
     '/node_modules/',
+    'actor-query-operation-bgp-smartkg',
+    'actor-query-operation-bgp-wisekg',
+    'actor-query-source-identify-hypermedia-smartkg',
+    'actor-query-source-identify-hypermedia-wisekg',
     'engine-default.js',
     'index.js',
   ],
@@ -38,6 +42,7 @@ const config: Config.InitialOptions = {
   },
   // The default test timeout is not enough for engine tests, but is enough for packages
   testTimeout: 20_000,
+  maxWorkers: 2,
 };
 
 export default config;

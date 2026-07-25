@@ -28,12 +28,13 @@ export class ActorOptimizeQueryOperationSmartKgShip extends ActorOptimizeQueryOp
     return passTestVoid();
   }
 
+  // Store the detected SmartKG star hints for later source-selection actors.
   public async run(action: IActionOptimizeQueryOperation): Promise<IActorOptimizeQueryOperationOutput> {
     const stars = extractStars(action.operation);
     let context: IActionContext = action.context;
 
-    if (typeof (context as any).setRaw === 'function') {
-      context = (context as any).setRaw('smartkgStars', stars);
+    if (typeof (<any> context).setRaw === 'function') {
+      context = (<any> context).setRaw('smartkgStars', stars);
     }
 
     return {
@@ -43,6 +44,7 @@ export class ActorOptimizeQueryOperationSmartKgShip extends ActorOptimizeQueryOp
   }
 }
 
+// Group patterns by subject and choose a shipping hint for each star.
 function extractStars(operation: Algebra.Operation): ISmartKgStarHint[] {
   const patterns: Algebra.Pattern[] = [];
   collectPatternsRecursive(operation, patterns, new Set<Algebra.Pattern>());
@@ -61,9 +63,9 @@ function extractStars(operation: Algebra.Operation): ISmartKgStarHint[] {
     patternCount: starPatterns.length,
     strategy:
       starPatterns.length >= 2 &&
-      starPatterns.every(pattern => pattern.predicate.termType !== 'Variable')
-        ? 'P-S'
-        : 'TP-S',
+      starPatterns.every(pattern => pattern.predicate.termType !== 'Variable') ?
+        'P-S' :
+        'TP-S',
   }));
 }
 
@@ -76,29 +78,30 @@ function collectPatternsRecursive(
   seen: Set<Algebra.Pattern>,
 ): void {
   if (operation.type === Algebra.Types.PATTERN) {
-    pushPattern(operation as Algebra.Pattern, patterns, seen);
+    pushPattern(<Algebra.Pattern> operation, patterns, seen);
     return;
   }
 
-  const op = operation as any;
+  const op = <any> operation;
 
   if (Array.isArray(op.input)) {
     for (const child of op.input) {
-      collectPatternsRecursive(child as Algebra.Operation, patterns, seen);
+      collectPatternsRecursive(<Algebra.Operation> child, patterns, seen);
     }
   } else if (op.input) {
-    collectPatternsRecursive(op.input as Algebra.Operation, patterns, seen);
+    collectPatternsRecursive(<Algebra.Operation> op.input, patterns, seen);
   }
 
   if (Array.isArray(op.patterns)) {
     for (const child of op.patterns) {
       if (child?.type === Algebra.Types.PATTERN) {
-        pushPattern(child as Algebra.Pattern, patterns, seen);
+        pushPattern(<Algebra.Pattern> child, patterns, seen);
       }
     }
   }
 }
 
+// Append a pattern once while preserving traversal order.
 function pushPattern(pattern: Algebra.Pattern, patterns: Algebra.Pattern[], seen: Set<Algebra.Pattern>): void {
   if (seen.has(pattern)) {
     return;

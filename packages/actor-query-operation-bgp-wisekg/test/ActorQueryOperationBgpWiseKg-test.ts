@@ -15,7 +15,7 @@ describe('ActorQueryOperationBgpWiseKg', () => {
       actor = new ActorQueryOperationBgpWiseKg({
         name: 'test-bgp-wisekg',
         bus: new Bus({ name: 'bus' }),
-        mediatorQueryOperation: {} as any,
+        mediatorQueryOperation: <any> {},
       });
     });
 

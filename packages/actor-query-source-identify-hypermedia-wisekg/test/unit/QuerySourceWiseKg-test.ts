@@ -1,4 +1,4 @@
-import { Readable } from 'stream';
+import { Readable } from 'node:stream';
 import { KeysInitQuery } from '@comunica/context-entries';
 import { ActionContext } from '@comunica/core';
 import { AlgebraFactory } from '@comunica/utils-algebra';
@@ -6,11 +6,11 @@ import { BindingsFactory } from '@comunica/utils-bindings-factory';
 import { DataFactory } from 'rdf-data-factory';
 import { QuerySourceWiseKg } from '../../lib/QuerySourceWiseKg';
 
-jest.mock('hdt', () => ({ fromFile: jest.fn() }));
+jest.mock<typeof import('hdt')>('hdt', () => ({ fromFile: jest.fn() }));
 
 const DF = new DataFactory();
-const BF = new BindingsFactory(DF as any);
-const AF = new AlgebraFactory(DF as any);
+const BF = new BindingsFactory(<any> DF);
+const AF = new AlgebraFactory(<any> DF);
 
 const patterns = [
   AF.createPattern(
@@ -71,33 +71,33 @@ describe('QuerySourceWiseKg', () => {
 
   it('should serialize BGPs for /plan', () => {
     const source = createSource();
-    expect((source as any).serializeBgpForPlan(patterns)).toBe(expectedBgp);
+    expect((<any> source).serializeBgpForPlan(patterns)).toBe(expectedBgp);
   });
 
   it('should construct a /plan URL from the source origin', () => {
     const source = createSource('http://localhost:8080/smartkg');
-    const url = (source as any).buildWiseKgPlanUrl(patterns, context);
+    const url = (<any> source).buildWiseKgPlanUrl(patterns, context);
 
-    expect(url).toBe(`http://localhost:8080/plan?bgp=${encodeURIComponent(expectedBgp)}`);
+    expect(url).toBe(`http://localhost:8080/plan?bgp=${encodeURIComponent(expectedBgp)}&speed=1&latency=1000`);
   });
 
   it('should map partition controls to molecule HDT URLs', () => {
     const source = createSource('http://localhost:8080/smartkg');
-    expect((source as any).getPartitionHdtUrlForControl('partition/35'))
+    expect((<any> source).getPartitionHdtUrlForControl('partition/35'))
       .toBe('http://localhost:8080/molecule/smartkg/35.hdt');
   });
 
   it('should evaluate wisekg controls through the original source path', async() => {
     const source = createSource();
-    const sourceAny = source as any;
+    const sourceAny = <any> source;
     const input = [ await sourceAny.emptyBinding() ];
     const sourceResult = BF.fromRecord({
       review: DF.namedNode('http://db.uwaterloo.ca/~galuc/wsdbm/Review1'),
       rating: DF.literal('5'),
     });
 
-    sourceAny.queryStarViaOriginalSource = jest.fn(async() => [ sourceResult ]);
-    sourceAny.fetchPartitionFileByControl = jest.fn();
+    jest.spyOn(sourceAny, 'queryStarViaOriginalSource').mockImplementation(async() => [ sourceResult ]);
+    jest.spyOn(sourceAny, 'fetchPartitionFileByControl').mockImplementation();
 
     const starPatterns = sourceAny.wiseKgStarToPatterns(wisekgStep.star);
     const results = await sourceAny.evaluateWiseKgStep(wisekgStep, starPatterns, input, context);
@@ -117,15 +117,15 @@ describe('QuerySourceWiseKg', () => {
       })),
     };
     const source = createSource('http://localhost:8080/smartkg', mediatorHttp);
-    const sourceAny = source as any;
+    const sourceAny = <any> source;
     const fallbackResult = BF.fromRecord({
       item: DF.namedNode('http://example.org/item'),
     });
-    sourceAny.queryStarViaOriginalSource = jest.fn(async() => [ fallbackResult ]);
+    jest.spyOn(sourceAny, 'queryStarViaOriginalSource').mockImplementation(async() => [ fallbackResult ]);
 
     const results = await sourceAny.evaluateBgp(AF.createBgp([ patterns[0] ]), context);
 
-    expect(mediatorHttp.mediate).toHaveBeenCalledTimes(1);
+    expect(mediatorHttp.mediate).toHaveBeenCalledTimes(3);
     expect(sourceAny.queryStarViaOriginalSource).toHaveBeenCalledTimes(1);
     expect(results).toHaveLength(1);
     expect(results[0].get(DF.variable('item'))?.equals(DF.namedNode('http://example.org/item'))).toBe(true);
@@ -135,7 +135,7 @@ describe('QuerySourceWiseKg', () => {
 function createSource(url = 'http://localhost:8080/wisekg', mediatorHttp?: any): QuerySourceWiseKg {
   return new QuerySourceWiseKg(
     url,
-    DF as any,
+    <any> DF,
     mediatorHttp ?? {
       mediate: jest.fn(async() => ({
         ok: true,

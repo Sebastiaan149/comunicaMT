@@ -4,19 +4,6 @@
   "description": "A Comunica actor that optimizes query operations for Smart-KG by decomposing joins into stars and determining partition vs TPF shipping strategies",
   "lsd:module": true,
   "license": "MIT",
-  "main": "lib/index.js",
-  "types": "lib/index",
-  "files": [
-    "components",
-    "lib/**/*.d.ts",
-    "lib/**/*.js",
-    "lib/**/*.js.map"
-  ],
-  "scripts": {
-    "build": "yarn run build:ts && yarn run build:components",
-    "build:ts": "node \"../../node_modules/typescript/bin/tsc\"",
-    "build:components": "componentsjs-generator"
-  },
   "keywords": [
     "comunica",
     "actor",
@@ -26,6 +13,22 @@
     "sparql"
   ],
   "sideEffects": false,
+  "main": "lib/index.js",
+  "types": "lib/index",
+  "files": [
+    "components",
+    "lib/**/*.d.ts",
+    "lib/**/*.js",
+    "lib/**/*.js.map"
+  ],
+  "engines": {
+    "node": ">=14.0"
+  },
+  "scripts": {
+    "build": "yarn run build:ts && yarn run build:components",
+    "build:ts": "node \"../../node_modules/typescript/bin/tsc\"",
+    "build:components": "componentsjs-generator"
+  },
   "publishConfig": {
     "access": "public"
   },
@@ -45,8 +48,5 @@
     "eslint": "^8.0.0",
     "jest": "^29.0.0",
     "typescript": "^5.0.0"
-  },
-  "engines": {
-    "node": ">=14.0"
   }
 }

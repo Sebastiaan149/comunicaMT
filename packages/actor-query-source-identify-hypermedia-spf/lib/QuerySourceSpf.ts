@@ -11,14 +11,15 @@ import type {
   IQuerySource,
   MetadataBindings,
 } from '@comunica/types';
-import { Algebra, AlgebraFactory, isKnownOperation } from '@comunica/utils-algebra';
+import type { AlgebraFactory } from '@comunica/utils-algebra';
+import { Algebra, isKnownOperation } from '@comunica/utils-algebra';
 import type { BindingsFactory } from '@comunica/utils-bindings-factory';
 import { MetadataValidationState } from '@comunica/utils-metadata';
 import type * as RDF from '@rdfjs/types';
 import { BufferedIterator, EmptyIterator } from 'asynciterator';
 import { termToString } from 'rdf-string';
 import { termToString as termToStringTtl } from 'rdf-string-ttl';
-import { Readable } from 'stream';
+import { Readable } from 'readable-stream';
 
 const VOID_TRIPLES = 'http://rdfs.org/ns/void#triples';
 const DEFAULT_MAX_MPR = 50;
@@ -60,9 +61,10 @@ interface ISpfStarChoice {
 type BindingChunk = RDF.Bindings[];
 
 interface IBindingChunkIterator {
-  getNext(): Promise<BindingChunk | undefined>;
+  getNext: () => Promise<BindingChunk | undefined>;
 }
 
+// Query source that evaluates BGPs through Star Pattern Fragment requests.
 export class QuerySourceSpf implements IQuerySource {
   public readonly sourceType = SOURCE_TYPE;
   public readonly referenceValue: string;
@@ -136,10 +138,12 @@ export class QuerySourceSpf implements IQuerySource {
     return 1;
   }
 
+  // Expose the SPF selector shape for patterns, BGPs, and joins.
   public async getSelectorShape(_context: IActionContext): Promise<FragmentSelectorShape> {
     return this.selectorShape;
   }
 
+  // Decompose the operation into subject stars and stream joined bindings.
   public queryBindings(
     operation: Algebra.Operation,
     context: IActionContext,
@@ -148,7 +152,7 @@ export class QuerySourceSpf implements IQuerySource {
     const patterns = this.getOperationPatterns(operation);
     const bgp = this.algebraFactory.createBgp(patterns);
     const variables = getOperationVariables(bgp);
-    return new SpfBindingsIterator(
+    return <BindingsStream> <unknown> new SpfBindingsIterator(
       Promise.resolve(new QueryIterator(
         new BasicGraphPatternIterator(
           new RootBindingChunkIterator(this.bindingsFactory.bindings()),
@@ -160,9 +164,10 @@ export class QuerySourceSpf implements IQuerySource {
       )),
       variables,
       this.maxMpR,
-    ) as unknown as BindingsStream;
+    );
   }
 
+  // Return no quads because SPF is used through bindings in this actor.
   public queryQuads(_operation: Algebra.Operation, _context: IActionContext): EmptyIterator<RDF.Quad> {
     return new EmptyIterator<RDF.Quad>();
   }
@@ -179,6 +184,7 @@ export class QuerySourceSpf implements IQuerySource {
     return `QuerySourceSpf(${this.referenceValue})`;
   }
 
+  // Return the Hydra control information used to build SPF request URLs.
   public getControl(): ISpfSourceControl {
     return {
       searchForm: this.searchForm,
@@ -186,6 +192,7 @@ export class QuerySourceSpf implements IQuerySource {
     };
   }
 
+  // Fetch the first page for a star and the current input-binding chunk.
   public async fetchFirstSpfPage(
     star: ISpfStar,
     bindings: BindingChunk,
@@ -194,6 +201,7 @@ export class QuerySourceSpf implements IQuerySource {
     return this.fetchSpfPage(star, bindings, context);
   }
 
+  // Fetch a continuation page for a star and the current input-binding chunk.
   public async fetchNextSpfPage(
     star: ISpfStar,
     bindings: BindingChunk,
@@ -203,14 +211,17 @@ export class QuerySourceSpf implements IQuerySource {
     return this.fetchSpfPage(star, bindings, context, pageUrl);
   }
 
+  // Match RDF quads from a page back into bindings for one star.
   public matchPageToStarBindings(star: ISpfStar, page: ISpfPage): RDF.Bindings[] {
     return matchStarResponse(star, page.quads, this.bindingsFactory);
   }
 
+  // Join two chunks of bindings using compatible variable assignments.
   public joinBindingChunks(left: BindingChunk, right: BindingChunk): BindingChunk {
     return joinBindingSets(left, right, this.bindingsFactory);
   }
 
+  // Extract supported pattern lists from the operation shape.
   private getOperationPatterns(operation: Algebra.Operation): Algebra.Pattern[] {
     if (isKnownOperation(operation, Algebra.Types.PATTERN)) {
       return [ operation ];
@@ -228,6 +239,7 @@ export class QuerySourceSpf implements IQuerySource {
     throw new Error(`Unsupported operation type '${operation.type}' for QuerySourceSpf.`);
   }
 
+  // Dereference an SPF URL and split metadata from data quads.
   private async fetchSpfPage(
     star: ISpfStar,
     bindings: BindingChunk,
@@ -263,17 +275,19 @@ export class QuerySourceSpf implements IQuerySource {
   }
 }
 
+// Detect whether a query source instance is the SPF implementation.
 export function isQuerySourceSpf(source: unknown): source is QuerySourceSpf {
-  return Boolean(source) && (source as { sourceType?: string }).sourceType === SOURCE_TYPE;
+  return Boolean(source) && (<{ sourceType?: string }> source).sourceType === SOURCE_TYPE;
 }
 
+// Detect an SPF Hydra search form in RDF metadata.
 export function detectSpfSearchForm(metadata: Record<string, any>): ISpfSourceControl | undefined {
   const searchForms = metadata.searchForms?.values;
   if (!Array.isArray(searchForms)) {
     return;
   }
 
-  for (const searchForm of searchForms as ISearchForm[]) {
+  for (const searchForm of <ISearchForm[]> searchForms) {
     const mappings = detectSpfMappings(searchForm);
     if (mappings) {
       return { searchForm, mappings };
@@ -281,6 +295,7 @@ export function detectSpfSearchForm(metadata: Record<string, any>): ISpfSourceCo
   }
 }
 
+// Build a fallback SPF search form for forced SPF sources.
 export function createSpfSearchForm(url: string): ISpfSourceControl {
   const dataset = stripQueryAndHash(url);
   const template = `${dataset}{?s,triples,star,values}`;
@@ -316,6 +331,7 @@ export function createSpfSearchForm(url: string): ISpfSourceControl {
   };
 }
 
+// Map Hydra template variables to the SPF fields required by the protocol.
 export function detectSpfMappings(searchForm: ISearchForm): ISpfSearchMappings | undefined {
   let subject: string | undefined;
   let triples: string | undefined;
@@ -340,6 +356,7 @@ export function detectSpfMappings(searchForm: ISearchForm): ISpfSearchMappings |
   }
 }
 
+// Split a BGP into subject stars that fit within the configured SPF size limit.
 export function decomposeSubjectStars(patterns: Algebra.Pattern[]): ISpfStar[] {
   const stars = new Map<string, ISpfStar>();
   for (const pattern of patterns) {
@@ -366,6 +383,7 @@ export function decomposeSubjectStars(patterns: Algebra.Pattern[]): ISpfStar[] {
   return decomposedStars;
 }
 
+// Build the concrete SPF request URL for one star and one binding chunk.
 export function createSpfRequestUrl(
   control: ISpfSourceControl,
   star: ISpfStar,
@@ -392,6 +410,7 @@ export function createSpfRequestUrl(
   return control.searchForm.getUri(entries);
 }
 
+// Emits the initial empty binding chunk that starts BGP evaluation.
 class RootBindingChunkIterator implements IBindingChunkIterator {
   private emitted = false;
 
@@ -406,6 +425,7 @@ class RootBindingChunkIterator implements IBindingChunkIterator {
   }
 }
 
+// Emits one precomputed binding chunk for the next star pipeline stage.
 class SingletonBindingChunkIterator implements IBindingChunkIterator {
   private emitted = false;
 
@@ -420,6 +440,7 @@ class SingletonBindingChunkIterator implements IBindingChunkIterator {
   }
 }
 
+// Evaluates one subject star against SPF pages and joins page matches.
 class StarPatternIterator implements IBindingChunkIterator {
   private currentPage: ISpfPage | undefined;
   private currentSourceChunk: BindingChunk | undefined;
@@ -458,6 +479,7 @@ class StarPatternIterator implements IBindingChunkIterator {
     return this.unreadMappings.splice(0, this.maxMpR);
   }
 
+  // Reuse an already-fetched first page when star ordering selected it.
   private async fetchFirstPageForCurrentChunk(): Promise<ISpfPage> {
     if (!this.firstPageConsumed && this.firstPage) {
       this.firstPageConsumed = true;
@@ -466,6 +488,7 @@ class StarPatternIterator implements IBindingChunkIterator {
     return this.source.fetchFirstSpfPage(this.star, this.currentSourceChunk!, this.context);
   }
 
+  // Join current page matches with the current input chunk.
   private joinCurrentPage(): BindingChunk {
     if (!this.currentPage || !this.currentSourceChunk) {
       return [];
@@ -475,6 +498,7 @@ class StarPatternIterator implements IBindingChunkIterator {
   }
 }
 
+// Chains star iterators together to evaluate the complete BGP.
 class BasicGraphPatternIterator implements IBindingChunkIterator {
   private currentPipeline: IBindingChunkIterator | undefined;
 
@@ -522,6 +546,7 @@ class BasicGraphPatternIterator implements IBindingChunkIterator {
     return result;
   }
 
+  // Select the next star using available cardinality estimates.
   private async chooseNextStar(stars: ISpfStar[], currentBindings: BindingChunk): Promise<ISpfStarChoice> {
     let best: ISpfStarChoice | undefined;
     let firstAbsentCount: ISpfStarChoice | undefined;
@@ -552,6 +577,7 @@ class BasicGraphPatternIterator implements IBindingChunkIterator {
   }
 }
 
+// Flattens binding chunks into one binding at a time for the stream wrapper.
 class QueryIterator {
   private currentChunk: BindingChunk = [];
 
@@ -569,6 +595,7 @@ class QueryIterator {
   }
 }
 
+// Adapts the SPF query iterator to a Comunica bindings stream.
 class SpfBindingsIterator extends BufferedIterator<RDF.Bindings> {
   private emitted = 0;
   private readonly state = new MetadataValidationState();
@@ -586,14 +613,17 @@ class SpfBindingsIterator extends BufferedIterator<RDF.Bindings> {
       variables,
       next: [],
     } satisfies MetadataBindings);
-    void this.pushAll(queryIteratorPromise);
+    this.pushAll(queryIteratorPromise).catch(error => this.destroy(<Error> error));
   }
 
   private async pushAll(queryIteratorPromise: Promise<QueryIterator>): Promise<void> {
     try {
       const queryIterator = await queryIteratorPromise;
-      let binding: RDF.Bindings | undefined;
-      while ((binding = await queryIterator.getNextBinding())) {
+      while (true) {
+        const binding = await queryIterator.getNextBinding();
+        if (!binding) {
+          break;
+        }
         const key = bindingKey(binding);
         if (this.seenBindings.has(key)) {
           continue;
@@ -611,7 +641,7 @@ class SpfBindingsIterator extends BufferedIterator<RDF.Bindings> {
       this.state.invalidate();
       this.close();
     } catch (error: unknown) {
-      this.destroy(error as Error);
+      this.destroy(<Error> error);
     }
   }
 
@@ -620,6 +650,7 @@ class SpfBindingsIterator extends BufferedIterator<RDF.Bindings> {
   }
 }
 
+// Match all quads in an SPF page against the requested subject star.
 function matchStarResponse(
   star: ISpfStar,
   quads: RDF.Quad[],
@@ -646,6 +677,7 @@ function matchStarResponse(
   return deduplicateBindings(results);
 }
 
+// Match one subject group against every triple pattern in the star.
 function matchStarGroup(star: ISpfStar, triplesForSubject: RDF.Quad[]): Record<string, RDF.Term>[] {
   let mappings: Record<string, RDF.Term>[] = [{}];
 
@@ -672,14 +704,15 @@ function matchStarGroup(star: ISpfStar, triplesForSubject: RDF.Quad[]): Record<s
   return mappings;
 }
 
+// Match a single quad against one algebra pattern.
 function matchTriplePattern(pattern: Algebra.Pattern, quad: RDF.Quad): Record<string, RDF.Term> | undefined {
   let mapping: Record<string, RDF.Term> = {};
-  for (const [ patternTerm, quadTerm ] of [
+  for (const [ patternTerm, quadTerm ] of <[RDF.Term, RDF.Term][]> [
     [ pattern.subject, quad.subject ],
     [ pattern.predicate, quad.predicate ],
     [ pattern.object, quad.object ],
     [ pattern.graph, quad.graph ],
-  ] as [RDF.Term, RDF.Term][]) {
+  ]) {
     const next = matchTerm(patternTerm, quadTerm, mapping);
     if (!next) {
       return;
@@ -689,6 +722,7 @@ function matchTriplePattern(pattern: Algebra.Pattern, quad: RDF.Quad): Record<st
   return mapping;
 }
 
+// Bind or compare one RDF term during pattern matching.
 function matchTerm(
   patternTerm: RDF.Term,
   dataTerm: RDF.Term,
@@ -705,6 +739,7 @@ function matchTerm(
   return { ...mapping, [patternTerm.value]: dataTerm };
 }
 
+// Join two binding chunks and remove duplicate bindings.
 function joinBindingSets(
   left: BindingChunk,
   right: BindingChunk,
@@ -724,6 +759,7 @@ function joinBindingSets(
   return deduplicateBindings(results);
 }
 
+// Merge two variable records when shared variables agree.
 function mergeRecords(
   left: Record<string, RDF.Term>,
   right: Record<string, RDF.Term>,
@@ -738,6 +774,7 @@ function mergeRecords(
   return merged;
 }
 
+// Encode an SPF star parameter from predicate and object positions.
 function encodeStar(star: ISpfStar): string {
   return star.patterns
     .flatMap((pattern, index) => {
@@ -748,10 +785,11 @@ function encodeStar(star: ISpfStar): string {
       ];
     })
     .join(';')
-    .replace(/^/, '[')
-    .replace(/$/, ']');
+    .replace(/^/u, '[')
+    .replace(/$/u, ']');
 }
 
+// Encode VALUES bindings for variables that are already bound.
 function encodeValues(star: ISpfStar, bindings: BindingChunk): string | undefined {
   const fields = getBoundStarFields(star, bindings);
   if (fields.length === 0) {
@@ -768,6 +806,7 @@ function encodeValues(star: ISpfStar, bindings: BindingChunk): string | undefine
   return `(${fields.map(field => `?${field.field}`).join(' ')}) { ${rows.join(' ')} }`;
 }
 
+// Deduplicate bindings by fields that are relevant to the current star.
 function deduplicateBindingsForStarFields(star: ISpfStar, bindings: BindingChunk): BindingChunk {
   const fields = getBoundStarFields(star, bindings);
   if (fields.length === 0) {
@@ -791,22 +830,12 @@ function deduplicateBindingsForStarFields(star: ISpfStar, bindings: BindingChunk
   return results;
 }
 
+// Encode variables and RDF terms in SPF URL parameters.
 function encodePatternTerm(term: RDF.Term): string {
   return term.termType === 'Variable' ? `?${term.value}` : termToStringTtl(term);
 }
 
-function getStarVariables(star: ISpfStar): Set<string> {
-  const variables = new Set<string>();
-  for (const pattern of star.patterns) {
-    for (const term of [ pattern.subject, pattern.predicate, pattern.object, pattern.graph ]) {
-      if (term.termType === 'Variable') {
-        variables.add(term.value);
-      }
-    }
-  }
-  return variables;
-}
-
+// Determine which star fields have bound values in the input chunk.
 function getBoundStarFields(
   star: ISpfStar,
   bindings: BindingChunk,
@@ -825,24 +854,27 @@ function getBoundStarFields(
   };
 
   addField(star.subject, 'subject');
-  star.patterns.forEach((pattern, index) => {
+  for (const [ index, pattern ] of star.patterns.entries()) {
     const position = index + 1;
     addField(pattern.predicate, `p${position}`);
     addField(pattern.object, `o${position}`);
-  });
+  }
   return fields;
 }
 
+// Check whether a binding chunk contains at least one bound variable.
 function hasBindings(bindings: BindingChunk): boolean {
   return bindings.some(binding => [ ...binding ].length > 0);
 }
 
+// Collect all pattern operations from a supported algebra tree.
 function collectPatterns(operation: Algebra.Operation): Algebra.Pattern[] {
   const patterns: Algebra.Pattern[] = [];
   collectPatternsRecursive(operation, patterns, new Set<Algebra.Pattern>());
   return patterns;
 }
 
+// Recursively visit nested algebra inputs while avoiding duplicate patterns.
 function collectPatternsRecursive(
   operation: Algebra.Operation,
   patterns: Algebra.Pattern[],
@@ -856,10 +888,10 @@ function collectPatternsRecursive(
     return;
   }
 
-  const operationLike = operation as Algebra.Operation & {
+  const operationLike = <Algebra.Operation & {
     input?: Algebra.Operation | Algebra.Operation[];
     patterns?: Algebra.Pattern[];
-  };
+  }> operation;
   if (Array.isArray(operationLike.input)) {
     for (const input of operationLike.input) {
       collectPatternsRecursive(input, patterns, seen);
@@ -874,6 +906,7 @@ function collectPatternsRecursive(
   }
 }
 
+// Determine metadata variables for a query operation.
 function getOperationVariables(operation: Algebra.Operation): MetadataBindings['variables'] {
   const seen = new Set<string>();
   const variables: MetadataBindings['variables'] = [];
@@ -888,6 +921,7 @@ function getOperationVariables(operation: Algebra.Operation): MetadataBindings['
   return variables;
 }
 
+// Convert an RDF/JS bindings object into a plain variable record.
 function bindingToRecord(binding: RDF.Bindings): Record<string, RDF.Term> {
   const record: Record<string, RDF.Term> = {};
   for (const [ variable, value ] of binding) {
@@ -896,6 +930,7 @@ function bindingToRecord(binding: RDF.Bindings): Record<string, RDF.Term> {
   return record;
 }
 
+// Remove duplicate RDF/JS binding objects by stable term strings.
 function deduplicateBindings(bindings: RDF.Bindings[]): RDF.Bindings[] {
   const seen = new Set<string>();
   const results: RDF.Bindings[] = [];
@@ -909,6 +944,7 @@ function deduplicateBindings(bindings: RDF.Bindings[]): RDF.Bindings[] {
   return results;
 }
 
+// Remove duplicate plain variable records by stable term strings.
 function deduplicateRecords(records: Record<string, RDF.Term>[]): Record<string, RDF.Term>[] {
   const seen = new Set<string>();
   const results: Record<string, RDF.Term>[] = [];
@@ -925,6 +961,7 @@ function deduplicateRecords(records: Record<string, RDF.Term>[]): Record<string,
   return results;
 }
 
+// Create a stable string key for an RDF/JS bindings object.
 function bindingKey(binding: RDF.Bindings): string {
   return [ ...binding ]
     .map(([ variable, value ]) => `${variable.value}=${stableTermToString(value)}`)
@@ -932,18 +969,20 @@ function bindingKey(binding: RDF.Bindings): string {
     .join('|');
 }
 
+// Extract void:triples cardinality from metadata quads.
 function extractVoidTriples(metadataQuads: RDF.Quad[]): number | undefined {
   for (const quad of metadataQuads) {
     if (quad.predicate.value === VOID_TRIPLES) {
       const value = Number.parseInt(quad.object.value, 10);
       if (Number.isNaN(value)) {
-        throw new Error(`Malformed SPF metadata: void:triples value '${quad.object.value}' is not a number.`);
+        throw new TypeError(`Malformed SPF metadata: void:triples value '${quad.object.value}' is not a number.`);
       }
       return value;
     }
   }
 }
 
+// Extract cardinality from Comunica metadata when available.
 function extractMetadataCardinality(metadata: Record<string, any>): number | undefined {
   const cardinality = metadata.cardinality;
   const value = cardinality?.value;
@@ -951,7 +990,7 @@ function extractMetadataCardinality(metadata: Record<string, any>): number | und
     return;
   }
   if (typeof value !== 'number' || Number.isNaN(value)) {
-    throw new Error(`Malformed SPF metadata: cardinality value '${String(value)}' is not a number.`);
+    throw new TypeError(`Malformed SPF metadata: cardinality value '${String(value)}' is not a number.`);
   }
   if (value === 0 && !cardinality.dataset) {
     return;
@@ -959,6 +998,7 @@ function extractMetadataCardinality(metadata: Record<string, any>): number | und
   return value;
 }
 
+// Extract the next page URL from Comunica metadata.
 function extractNextPageUrl(metadata: Record<string, any>): string | undefined {
   const next = metadata.next;
   if (Array.isArray(next)) {
@@ -967,10 +1007,11 @@ function extractNextPageUrl(metadata: Record<string, any>): string | undefined {
   return typeof next === 'string' ? next : undefined;
 }
 
+// Collect an RDF stream into an array while validating quad-like values.
 function collectRdfStream(stream: RDF.Stream, label: string): Promise<RDF.Quad[]> {
   return new Promise((resolve, reject) => {
     const quads: RDF.Quad[] = [];
-    stream.on('error', error => reject(new Error(`Failed to parse ${label}: ${(error as Error).message}`)));
+    stream.on('error', error => reject(new Error(`Failed to parse ${label}: ${(<Error> error).message}`)));
     stream.on('data', (quad: RDF.Quad) => {
       if (!isQuadLike(quad)) {
         reject(new Error(`Malformed ${label}: expected RDF/JS quads.`));
@@ -982,25 +1023,29 @@ function collectRdfStream(stream: RDF.Stream, label: string): Promise<RDF.Quad[]
   });
 }
 
+// Convert collected quads back into an RDF stream for metadata extraction.
 function rdfStreamFromArray(quads: RDF.Quad[]): RDF.Stream {
-  return Readable.from(quads, { objectMode: true }) as RDF.Stream;
+  return <RDF.Stream> Readable.from(quads, { objectMode: true });
 }
 
+// Validate that a value looks like an RDF/JS quad.
 function isQuadLike(quad: unknown): quad is RDF.Quad {
   return Boolean(quad) &&
-    isTermLike((quad as RDF.Quad).subject) &&
-    isTermLike((quad as RDF.Quad).predicate) &&
-    isTermLike((quad as RDF.Quad).object) &&
-    isTermLike((quad as RDF.Quad).graph);
+    isTermLike((<RDF.Quad> quad).subject) &&
+    isTermLike((<RDF.Quad> quad).predicate) &&
+    isTermLike((<RDF.Quad> quad).object) &&
+    isTermLike((<RDF.Quad> quad).graph);
 }
 
+// Validate that a value looks like an RDF/JS term.
 function isTermLike(term: unknown): term is RDF.Term {
   return Boolean(term) &&
-    typeof (term as RDF.Term).termType === 'string' &&
-    typeof (term as RDF.Term).value === 'string' &&
-    typeof (term as RDF.Term).equals === 'function';
+    typeof (<RDF.Term> term).termType === 'string' &&
+    typeof (<RDF.Term> term).value === 'string' &&
+    typeof (<RDF.Term> term).equals === 'function';
 }
 
+// Normalize Hydra property IRIs to their local names.
 function getHydraPropertyName(property: string): string {
   const decoded = decodeURIComponent(property);
   const hashIndex = decoded.lastIndexOf('#');
@@ -1010,13 +1055,15 @@ function getHydraPropertyName(property: string): string {
   return decoded.slice(index + 1).toLowerCase();
 }
 
+// Convert an RDF term to the canonical string used for grouping.
 function stableTermToString(term: RDF.Term): string {
   return termToString(term);
 }
 
+// Remove query and hash parts from a dataset URL.
 function stripQueryAndHash(url: string): string {
   const parsed = new URL(url);
   parsed.search = '';
   parsed.hash = '';
-  return parsed.toString().replace(/\/$/, '');
+  return parsed.toString().replace(/\/$/u, '');
 }

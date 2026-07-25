@@ -52,7 +52,7 @@ This actor can be registered in a Comunica engine configuration:
    - Verifies no infrequent predicates are used
    - Queries SmartKG metadata for matching families
    - Calculates if number of families is within threshold
-4. **Routes Patterns**: 
+4. **Routes Patterns**:
    - SmartKG candidates → routed to SmartKG source
    - Others → routed to standard BGP handling
 5. **Joins Results**: Combines results from all patterns

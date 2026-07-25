@@ -1,8 +1,8 @@
+import { isQuerySourceSpf } from '@comunica/actor-query-source-identify-hypermedia-spf';
 import type { IActorQueryOperationArgs } from '@comunica/bus-query-operation';
 import { ActorQueryOperationTyped } from '@comunica/bus-query-operation';
 import type { IActorTest, TestResult } from '@comunica/core';
 import { failTest, passTest } from '@comunica/core';
-import { isQuerySourceSpf } from '@comunica/actor-query-source-identify-hypermedia-spf';
 import type { IActionContext, IQueryOperationResult, IQuerySourceWrapper } from '@comunica/types';
 import { Algebra } from '@comunica/utils-algebra';
 import { getMetadataBindings } from '@comunica/utils-metadata';
@@ -27,6 +27,7 @@ export class ActorQueryOperationBgpSpf extends ActorQueryOperationTyped<Algebra.
     return passTest({ httpRequests: 0 });
   }
 
+  // Execute the BGP directly against the SPF query source and expose metadata.
   public async runOperation(
     operation: Algebra.Bgp,
     context: IActionContext,

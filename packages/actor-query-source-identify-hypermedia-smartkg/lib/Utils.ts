@@ -1,6 +1,6 @@
 import type { Algebra } from '@comunica/utils-algebra';
-import { termToString } from 'rdf-string';
 import type * as RDF from '@rdfjs/types';
+import { termToString } from 'rdf-string';
 
 export interface ISmartKgFamily {
   index: number;
@@ -9,6 +9,7 @@ export interface ISmartKgFamily {
   numTriples: number;
   grouped?: boolean;
   predicateSet: string[];
+  classesSet?: string[];
   sourceSet?: number[];
   originalFamily?: number;
   noMaterialized?: boolean;
@@ -27,6 +28,7 @@ export interface ISmartKgStarHint {
   strategy: 'P-S' | 'TP-S';
 }
 
+// Collect concrete predicates from a group of algebra patterns.
 export function extractPredicates(patterns: Algebra.Pattern[]): Set<string> {
   const predicates = new Set<string>();
   for (const pattern of patterns) {
@@ -37,6 +39,7 @@ export function extractPredicates(patterns: Algebra.Pattern[]): Set<string> {
   return predicates;
 }
 
+// Check whether any pattern predicate is blocked by metadata.
 export function hasInfrequentPredicate(patterns: Algebra.Pattern[], blockedPredicates: Set<string>): boolean {
   for (const pattern of patterns) {
     if (pattern.predicate.termType !== 'Variable' && blockedPredicates.has(termToString(pattern.predicate))) {
@@ -46,10 +49,12 @@ export function hasInfrequentPredicate(patterns: Algebra.Pattern[], blockedPredi
   return false;
 }
 
+// Alias for blocked-predicate checks used by SmartKG selection logic.
 export function hasBlockedPredicate(patterns: Algebra.Pattern[], blockedPredicates: Set<string>): boolean {
   return hasInfrequentPredicate(patterns, blockedPredicates);
 }
 
+// Find families whose predicate set fully covers the query predicates.
 export function findMatchingFamilies(
   queryPredicates: Set<string>,
   families: ISmartKgFamily[],
@@ -79,6 +84,7 @@ export function findMatchingFamilies(
   return matching;
 }
 
+// Resolve derived families to concrete materialized families before querying.
 export function resolveFamiliesToMaterialized(
   families: ISmartKgFamily[],
   metadata: ISmartKgMetadata,
@@ -140,6 +146,7 @@ interface ISelectOptimalFamiliesOptions {
   completeCoverage?: boolean;
 }
 
+// Choose the smallest useful family set, optionally resolving to materialized data.
 export function selectOptimalFamilies(
   matchingFamilies: ISmartKgFamily[],
   metadataOrOptions?: ISmartKgMetadata | ISelectOptimalFamiliesOptions,
@@ -152,7 +159,7 @@ export function selectOptimalFamilies(
     metadata = metadataOrOptions;
     options = maybeOptions;
   } else {
-    options = metadataOrOptions as ISelectOptimalFamiliesOptions | undefined;
+    options = metadataOrOptions;
   }
 
   const preferGrouped = options?.preferGrouped ?? true;
@@ -194,8 +201,9 @@ export function selectOptimalFamilies(
   return candidates.slice(0, maxFamilies);
 }
 
+// Parse SmartKG metadata while tolerating sparse arrays in server JSON.
 export function parseSmartKgMetadata(jsonStr: string): ISmartKgMetadata {
-  const raw = JSON.parse(jsonStr) as Record<string, any>;
+  const raw = <Record<string, any>> JSON.parse(normalizeLooseJsonArrays(jsonStr));
   const familiesRaw = Array.isArray(raw.families) ? raw.families : [];
   return {
     numFamilies: typeof raw.numFamilies === 'number' ? raw.numFamilies : familiesRaw.length,
@@ -208,13 +216,28 @@ export function parseSmartKgMetadata(jsonStr: string): ISmartKgMetadata {
       numTriples: typeof family.numTriples === 'number' ? family.numTriples : 0,
       grouped: Boolean(family.grouped),
       predicateSet: Array.isArray(family.predicateSet) ? family.predicateSet : [],
-      sourceSet: Array.isArray(family.sourceSet) ? family.sourceSet.filter((value: unknown) => typeof value === 'number') : undefined,
+      classesSet: Array.isArray(family.classesSet) ?
+        family.classesSet.filter((value: unknown) => typeof value === 'string') :
+        undefined,
+      sourceSet: Array.isArray(family.sourceSet) ?
+        family.sourceSet.filter((value: unknown) => typeof value === 'number') :
+        undefined,
       originalFamily: typeof family.originalFamily === 'number' ? family.originalFamily : undefined,
       noMaterialized: Boolean(family.noMaterialized),
     })),
   };
 }
 
+// Normalize sparse JSON arrays so JSON.parse can accept metadata dumps.
+function normalizeLooseJsonArrays(jsonStr: string): string {
+  let normalized = jsonStr.replaceAll(/\[\s*,/gu, '[ null,');
+  while (/,\s*,/u.test(normalized)) {
+    normalized = normalized.replaceAll(/,\s*,/gu, ', null,');
+  }
+  return normalized.replaceAll(/,\s*\]/gu, ']');
+}
+
+// Convert predicate metadata arrays into sets used during family selection.
 export function metadataToSets(metadata: ISmartKgMetadata): {
   infrequentPredicates: Set<string>;
   massivePredicates: Set<string>;
@@ -226,6 +249,7 @@ export function metadataToSets(metadata: ISmartKgMetadata): {
   return { infrequentPredicates, massivePredicates, blockedPredicates };
 }
 
+// Decide whether a set of patterns is eligible for SmartKG processing.
 export function isStarPatternSmartKg(
   patterns: Algebra.Pattern[],
   metadata: ISmartKgMetadata,
@@ -248,6 +272,7 @@ export function isStarPatternSmartKg(
   return findMatchingFamilies(predicates, metadata.families).length > 0;
 }
 
+// Read the preferred SmartKG shipping strategy for a pattern subject.
 export function getShippingStrategyHint(
   context: any,
   pattern: Algebra.Pattern,
@@ -258,6 +283,7 @@ export function getShippingStrategyHint(
   return star?.strategy;
 }
 
+// Read the number of patterns in the SmartKG star that contains a pattern.
 export function getStarPatternCount(
   context: any,
   pattern: Algebra.Pattern,
@@ -267,6 +293,7 @@ export function getStarPatternCount(
   return stars.find(entry => entry.subject === subject)?.patternCount ?? 0;
 }
 
+// Count how many patterns in an operation share the target subject.
 export function detectStarPatternCount(
   operation: Algebra.Operation | undefined,
   targetSubject: RDF.Term,
@@ -281,40 +308,42 @@ export function detectStarPatternCount(
   return patterns.filter(pattern => termToString(pattern.subject) === targetSubjectStr).length;
 }
 
+// Recursively collect pattern operations from an algebra tree.
 export function collectPatternsRecursive(
   operation: Algebra.Operation,
   patterns: Algebra.Pattern[],
 ): void {
   if (operation.type === 'pattern') {
-    patterns.push(operation as Algebra.Pattern);
+    patterns.push(<Algebra.Pattern> operation);
     return;
   }
 
-  if ('input' in operation && (operation as any).input) {
-    const input = (operation as any).input;
+  if ('input' in operation && (<any> operation).input) {
+    const input = (<any> operation).input;
     if (Array.isArray(input)) {
       for (const child of input) {
-        collectPatternsRecursive(child as Algebra.Operation, patterns);
+        collectPatternsRecursive(<Algebra.Operation> child, patterns);
       }
     } else if (typeof input === 'object') {
-      collectPatternsRecursive(input as Algebra.Operation, patterns);
+      collectPatternsRecursive(<Algebra.Operation> input, patterns);
     }
   }
 }
 
+// Fetch SmartKG star hints from Comunica context or plain context objects.
 function getSmartKgStars(context: any): ISmartKgStarHint[] {
   if (!context) {
     return [];
   }
 
   if (Array.isArray(context.smartkgStars)) {
-    return context.smartkgStars as ISmartKgStarHint[];
+    return <ISmartKgStarHint[]> context.smartkgStars;
   }
 
   if (typeof context.getRaw === 'function') {
     const raw = context.getRaw('smartkgStars');
     if (Array.isArray(raw)) {
-      return raw as ISmartKgStarHint[];
+      return <ISmartKgStarHint[]> raw;
     }
   }
 

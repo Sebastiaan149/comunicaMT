@@ -29,6 +29,7 @@ export class ActorQueryOperationBgpSmartKg extends ActorQueryOperationTypedMedia
     this.minPatternCount = args.minPatternCount ?? 2;
   }
 
+  // Skip BGPs that already passed through this SmartKG annotation actor.
   public async testOperation(
     _operation: Algebra.Bgp,
     context: IActionContext,
@@ -39,6 +40,7 @@ export class ActorQueryOperationBgpSmartKg extends ActorQueryOperationTypedMedia
     return passTestVoid();
   }
 
+  // Attach star hints to the context before regular BGP query processing.
   public async runOperation(
     operation: Algebra.Bgp,
     context: IActionContext,
@@ -46,9 +48,9 @@ export class ActorQueryOperationBgpSmartKg extends ActorQueryOperationTypedMedia
     const stars = toStarHints(operation);
     let nextContext = context;
 
-    if (typeof (nextContext as any).setRaw === 'function') {
-      nextContext = (nextContext as any).setRaw('smartkgStars', stars);
-      nextContext = (nextContext as any).setRaw('smartkgBgpHandled', true);
+    if (typeof (<any> nextContext).setRaw === 'function') {
+      nextContext = (<any> nextContext).setRaw('smartkgStars', stars);
+      nextContext = (<any> nextContext).setRaw('smartkgBgpHandled', true);
     }
 
     return this.mediatorQueryOperation.mediate({
@@ -58,6 +60,7 @@ export class ActorQueryOperationBgpSmartKg extends ActorQueryOperationTypedMedia
   }
 }
 
+// Convert a BGP into per-subject SmartKG shipping hints.
 function toStarHints(operation: Algebra.Bgp): ISmartKgStarHint[] {
   const stars = new Map<string, Algebra.Pattern[]>();
 
@@ -73,25 +76,26 @@ function toStarHints(operation: Algebra.Bgp): ISmartKgStarHint[] {
     patternCount: patterns.length,
     strategy:
       patterns.length >= 2 &&
-      patterns.every(pattern => pattern.predicate.termType !== 'Variable')
-        ? 'P-S'
-        : 'TP-S',
+      patterns.every(pattern => pattern.predicate.termType !== 'Variable') ?
+        'P-S' :
+        'TP-S',
   }));
 }
 
+// Read context flags from both Comunica ActionContext and plain objects.
 function isContextFlagSet(context: unknown, key: string): boolean {
   if (!context) {
     return false;
   }
 
-  const rawValue = typeof (context as any).getRaw === 'function' ?
-    (context as any).getRaw(key) :
+  const rawValue = typeof (<any> context).getRaw === 'function' ?
+      (<any> context).getRaw(key) :
     undefined;
   if (rawValue !== undefined) {
     return Boolean(rawValue);
   }
 
-  return Boolean((context as Record<string, unknown>)[key]);
+  return Boolean((<Record<string, unknown>> context)[key]);
 }
 
 export interface IActorQueryOperationBgpSmartKgArgs extends IActorQueryOperationTypedMediatedArgs {

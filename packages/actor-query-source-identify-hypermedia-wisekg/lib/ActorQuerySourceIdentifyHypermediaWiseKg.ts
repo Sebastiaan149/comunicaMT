@@ -13,6 +13,7 @@ import type { ComunicaDataFactory } from '@comunica/types';
 import { QuerySourceWiseKg } from './QuerySourceWiseKg';
 import { isContextFlagSet, KEY_CONTEXT_WISEKG_FALLBACK } from './Utils';
 
+// Identifies WiseKG and SmartKG+ root sources and creates their query source.
 export class ActorQuerySourceIdentifyHypermediaWiseKg extends ActorQuerySourceIdentifyHypermedia {
   public readonly mediatorHttp: MediatorHttp;
   public readonly mediatorQuerySourceDereferenceLink?: any;
@@ -23,6 +24,7 @@ export class ActorQuerySourceIdentifyHypermediaWiseKg extends ActorQuerySourceId
     this.mediatorQuerySourceDereferenceLink = args.mediatorQuerySourceDereferenceLink;
   }
 
+  // Reject fallback loops and accept only WiseKG-compatible source types.
   public override async test(
     action: IActionQuerySourceIdentifyHypermedia,
   ): Promise<TestResult<IActorQuerySourceIdentifyHypermediaTest>> {
@@ -36,6 +38,7 @@ export class ActorQuerySourceIdentifyHypermediaWiseKg extends ActorQuerySourceId
     return this.testMetadata(action);
   }
 
+  // Detect WiseKG root dataset URLs when no source type was forced.
   public async testMetadata(
     action: IActionQuerySourceIdentifyHypermedia,
   ): Promise<TestResult<IActorQuerySourceIdentifyHypermediaTest>> {
@@ -50,16 +53,17 @@ export class ActorQuerySourceIdentifyHypermediaWiseKg extends ActorQuerySourceId
     return failTest(`Actor ${this.name} could not detect a WiseKG root dataset URL at ${action.url}.`);
   }
 
+  // Build a WiseKG query source and remove page links that would trigger crawling.
   public async run(
     action: IActionQuerySourceIdentifyHypermedia,
   ): Promise<IActorQuerySourceIdentifyHypermediaOutput> {
     const dataFactory: ComunicaDataFactory = action.context.getSafe(KeysInitQuery.dataFactory);
-    const metadataLinks = (action.metadata as Record<string, unknown> | undefined)?.links;
+    const metadataLinks = (<Record<string, unknown> | undefined> action.metadata)?.links;
     if (Array.isArray(metadataLinks)) {
       metadataLinks.length = 0;
     }
     if (action.metadata && typeof action.metadata === 'object') {
-      clearPageLinks(action.metadata as Record<string, unknown>);
+      clearPageLinks(<Record<string, unknown>> action.metadata);
     }
 
     const source = new QuerySourceWiseKg(
@@ -73,6 +77,7 @@ export class ActorQuerySourceIdentifyHypermediaWiseKg extends ActorQuerySourceId
   }
 }
 
+// Remove hypermedia pagination links so the root source owns traversal decisions.
 function clearPageLinks(metadata: Record<string, unknown>): void {
   metadata.next = [];
   metadata.previous = [];
@@ -80,10 +85,11 @@ function clearPageLinks(metadata: Record<string, unknown>): void {
   metadata.last = [];
 }
 
+// Detect root dataset URLs without query parameters.
 function isRootDatasetUrl(url: string): boolean {
   try {
     const parsedUrl = new URL(url);
-    return !parsedUrl.search && parsedUrl.pathname.replace(/\/$/u, '').split('/').filter(Boolean).length > 0;
+    return !parsedUrl.search && parsedUrl.pathname.replace(/\/$/u, '').split('/').some(Boolean);
   } catch {
     return !url.includes('?') && url.replace(/\/$/u, '').length > 0;
   }

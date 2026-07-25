@@ -1,12 +1,10 @@
 # Actor query process sequential recursive
 
-
-
 Very simple change performed on the [`actor-query-process-sequential`](https://github.com/comunica/comunica/tree/master/packages/actor-query-process-sequential).
 In the `parse` function, when the context was already initialized, we don't call initialize again…
 
 Without it, the physical plan may look like the following where the same source
-appears twice: 
+appears twice:
 
 ```
 slice src:0

@@ -1,21 +1,21 @@
-import type { IQueryProcessSequentialOutput } from '@comunica/bus-query-process';
 import type { IActorQueryProcessSequentialArgs } from '@comunica/actor-query-process-sequential';
 import { ActorQueryProcessSequential } from '@comunica/actor-query-process-sequential';
+import type { IQueryProcessSequentialOutput } from '@comunica/bus-query-process';
 import { KeysInitQuery } from '@comunica/context-entries';
 import { ActionContextKey } from '@comunica/core';
 import type { ComunicaDataFactory, IActionContext, IPhysicalQueryPlanLogger, QueryFormatType } from '@comunica/types';
 import { AlgebraFactory } from '@comunica/utils-algebra';
 import type { Algebra } from '@comunica/utils-algebra';
 import { BindingsFactory } from '@comunica/utils-bindings-factory';
-import {materializeOperation} from '@comunica/utils-query-operation';
+import { materializeOperation } from '@comunica/utils-query-operation';
 import type * as RDF from '@rdfjs/types';
 
 /**
  * A Sequential Query Process Actor that allows Recursive call even when the
  * physical/logical logger is defined.
+ * Used by Passage to allow recursive calls to the query process while still logging the physical/logical query plan.
  */
 export class ActorQueryProcessSequentialRecursive extends ActorQueryProcessSequential {
-
   public constructor(args: IActorQueryProcessSequentialArgs) {
     super(args);
   }
@@ -32,7 +32,7 @@ export class ActorQueryProcessSequentialRecursive extends ActorQueryProcessSeque
         context = context.set(KeysInitQuery.physicalQueryPlanLogger, factory());
       }
       context = context.set(initializedKey, true);
-      context = (await this.mediatorContextPreprocess.mediate({context, initialize: true})).context;
+      context = (await this.mediatorContextPreprocess.mediate({ context, initialize: true })).context;
     }
 
     // The rest is similar to parent's …
@@ -60,13 +60,13 @@ export class ActorQueryProcessSequentialRecursive extends ActorQueryProcessSeque
       const dataFactory: ComunicaDataFactory = context.getSafe(KeysInitQuery.dataFactory);
       const algebraFactory = new AlgebraFactory(dataFactory);
       const bindingsFactory = await BindingsFactory
-          .create(this.mediatorMergeBindingsContext, context, dataFactory);
+        .create(this.mediatorMergeBindingsContext, context, dataFactory);
       operation = materializeOperation(
-          operation,
-          context.get(KeysInitQuery.initialBindings)!,
-          algebraFactory,
-          bindingsFactory,
-          { strictTargetVariables: true },
+        operation,
+        context.get(KeysInitQuery.initialBindings)!,
+        algebraFactory,
+        bindingsFactory,
+        { strictTargetVariables: true },
       );
 
       // Delete the query string from the context, since our initial query might have changed

@@ -12,6 +12,7 @@ import { failTest, passTest } from '@comunica/core';
 import type { ComunicaDataFactory } from '@comunica/types';
 import { QuerySourceSmartKg } from './QuerySourceSmartKg';
 
+// Identifies SmartKG and SmartKG+ root sources and creates their query source.
 export class ActorQuerySourceIdentifyHypermediaSmartKg extends ActorQuerySourceIdentifyHypermedia {
   public readonly mediatorHttp: MediatorHttp;
   public readonly mediatorQuerySourceDereferenceLink?: any;
@@ -22,6 +23,7 @@ export class ActorQuerySourceIdentifyHypermediaSmartKg extends ActorQuerySourceI
     this.mediatorQuerySourceDereferenceLink = args.mediatorQuerySourceDereferenceLink;
   }
 
+  // Reject fallback loops and accept only SmartKG-compatible source types.
   public override async test(
     action: IActionQuerySourceIdentifyHypermedia,
   ): Promise<TestResult<IActorQuerySourceIdentifyHypermediaTest>> {
@@ -35,6 +37,7 @@ export class ActorQuerySourceIdentifyHypermediaSmartKg extends ActorQuerySourceI
     return this.testMetadata(action);
   }
 
+  // Detect SmartKG root dataset URLs when no source type was forced.
   public async testMetadata(
     action: IActionQuerySourceIdentifyHypermedia,
   ): Promise<TestResult<IActorQuerySourceIdentifyHypermediaTest>> {
@@ -43,39 +46,42 @@ export class ActorQuerySourceIdentifyHypermediaSmartKg extends ActorQuerySourceI
     }
 
     if (action.forceSourceType === 'smartkg' || action.forceSourceType === 'smartkg+') {
-      return passTest({ filterFactor: 2 });
+      return passTest({ filterFactor: 1 });
     }
 
     if (!isRootSmartKgUrl(action.url)) {
-      return failTest(`Actor ${this.name} only auto-detects root SmartKG dataset URLs.`);
+      return failTest(`Actor ${this.name} could not detect a SmartKG server at ${action.url}.`);
     }
 
-    return passTest({ filterFactor: 2 });
+    return passTest({ filterFactor: 1 });
   }
 
+  // Build a SmartKG query source and remove page links that would trigger crawling.
   public async run(
     action: IActionQuerySourceIdentifyHypermedia,
   ): Promise<IActorQuerySourceIdentifyHypermediaOutput> {
     const dataFactory: ComunicaDataFactory = action.context.getSafe(KeysInitQuery.dataFactory);
-    const metadataLinks = (action.metadata as Record<string, unknown> | undefined)?.links;
+    const metadataLinks = (<Record<string, unknown> | undefined> action.metadata)?.links;
     if (Array.isArray(metadataLinks)) {
       metadataLinks.length = 0;
     }
     if (action.metadata && typeof action.metadata === 'object') {
-      clearPageLinks(action.metadata as Record<string, unknown>);
+      clearPageLinks(<Record<string, unknown>> action.metadata);
     }
 
+    const sourceUrl = action.forceSourceType ? action.url : action.metadata.sparqlService || action.url;
     const source = new QuerySourceSmartKg(
-      action.url,
+      sourceUrl,
       dataFactory,
       this.mediatorHttp,
       action.context,
       this.mediatorQuerySourceDereferenceLink,
     );
-    return { source, dataset: action.url };
+    return { source, dataset: sourceUrl };
   }
 }
 
+// Remove hypermedia pagination links so the root source owns traversal decisions.
 function clearPageLinks(metadata: Record<string, unknown>): void {
   metadata.next = [];
   metadata.previous = [];
@@ -83,6 +89,7 @@ function clearPageLinks(metadata: Record<string, unknown>): void {
   metadata.last = [];
 }
 
+// Detect root SmartKG URLs without query parameters.
 function isRootSmartKgUrl(url: string): boolean {
   try {
     const parsedUrl = new URL(url);
@@ -92,24 +99,26 @@ function isRootSmartKgUrl(url: string): boolean {
   }
 }
 
+// Recognize the canonical SmartKG dataset path suffix.
 function isSmartKgDatasetPath(path: string): boolean {
   const normalizedPath = path.replace(/\/$/u, '').toLowerCase();
   return normalizedPath.endsWith('/smartkg');
 }
 
+// Read context flags from both Comunica ActionContext and plain objects.
 function isContextFlagSet(context: unknown, key: string): boolean {
   if (!context) {
     return false;
   }
 
-  const rawValue = typeof (context as any).getRaw === 'function' ?
-    (context as any).getRaw(key) :
+  const rawValue = typeof (<any> context).getRaw === 'function' ?
+      (<any> context).getRaw(key) :
     undefined;
   if (rawValue !== undefined) {
     return Boolean(rawValue);
   }
 
-  return Boolean((context as Record<string, unknown>)[key]);
+  return Boolean((<Record<string, unknown>> context)[key]);
 }
 
 export interface IActorQuerySourceIdentifyHypermediaSmartKgArgs extends IActorQuerySourceIdentifyHypermediaArgs {

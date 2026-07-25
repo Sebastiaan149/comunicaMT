@@ -1,8 +1,8 @@
+import type { BindMethod } from '@comunica/actor-query-source-identify-hypermedia-sparql';
+import { QuerySourceSparql } from '@comunica/actor-query-source-identify-hypermedia-sparql';
 import type { MediatorHttp } from '@comunica/bus-http';
 import type { MediatorQueryProcess } from '@comunica/bus-query-process';
 import type { MediatorQuerySerialize } from '@comunica/bus-query-serialize';
-import type { BindMethod } from '@comunica/actor-query-source-identify-hypermedia-sparql';
-import { QuerySourceSparql } from '@comunica/actor-query-source-identify-hypermedia-sparql';
 import { KeysInitQuery } from '@comunica/context-entries';
 import { ActionContextKey, Actor } from '@comunica/core';
 import type {
@@ -31,14 +31,7 @@ import { Shapes } from './Shapes';
  * Query source for Passage continuation-query endpoints.
  */
 export class QuerySourcePassage implements IQuerySource {
-  protected static readonly SELECTOR_SHAPE: FragmentSelectorShape =
-    process.env.SHAPE === 'tpf' ?
-      Shapes.TPF :
-      process.env.SHAPE === 'brtpf' ?
-        Shapes.BRTPF :
-        process.env.SHAPE === 'no-union' ?
-          Shapes.PASSAGE_NO_UNION :
-          Shapes.PASSAGE;
+  protected static readonly SELECTOR_SHAPE: FragmentSelectorShape = getDefaultSelectorShape();
 
   public readonly referenceValue: string;
   private readonly url: string;
@@ -100,11 +93,13 @@ export class QuerySourcePassage implements IQuerySource {
     return 1;
   }
 
+  // Select the operator shape from context overrides or the configured default.
   public async getSelectorShape(context: IActionContext): Promise<FragmentSelectorShape> {
     const shapeKey = new ActionContextKey<FragmentSelectorShape>('shape');
     return context.get(shapeKey) ?? this.context.get(shapeKey) ?? QuerySourcePassage.SELECTOR_SHAPE;
   }
 
+  // Serialize the algebra operation and start a Passage bindings stream.
   public queryBindings(
     operationIn: Algebra.Operation,
     context: IActionContext,
@@ -135,27 +130,20 @@ export class QuerySourcePassage implements IQuerySource {
     return bindings;
   }
 
+  // Attach early metadata before remote results or continuations are available.
   protected attachMetadata(
     target: AsyncIterator<any>,
     context: IActionContext,
     operationPromise: Promise<Algebra.Operation>,
     options?: IQueryBindingsOptions,
   ): void {
-    let variablesCount: MetadataVariable[] = [];
-    new Promise<Algebra.Operation>(async(resolve, reject) => {
-      try {
-        const operation = await operationPromise;
-        const undefVariables = QuerySourceSparql.getOperationUndefs(operation);
-        const variablesScoped = algebraUtils.inScopeVariables(operation);
-        variablesCount = variablesScoped.map(variable => ({
-          variable,
-          canBeUndef: undefVariables.some(undefVariable => undefVariable.equals(variable)),
-        }));
-        resolve(operation);
-      } catch (error: unknown) {
-        reject(error);
-      }
-    }).then(async(operation) => {
+    operationPromise.then(async(operation) => {
+      const undefVariables = QuerySourceSparql.getOperationUndefs(operation);
+      const variablesScoped = algebraUtils.inScopeVariables(operation);
+      const variablesCount: MetadataVariable[] = variablesScoped.map(variable => ({
+        variable,
+        canBeUndef: undefVariables.some(undefVariable => undefVariable.equals(variable)),
+      }));
       const selectQuery = await this.toSelectQuery(context, operation, options);
 
       target.setProperty('metadata', {
@@ -170,6 +158,7 @@ export class QuerySourcePassage implements IQuerySource {
     }).catch(error => target.destroy(error));
   }
 
+  // Execute one Passage request and append continuation requests when present.
   public async queryBindingsRemote(
     operation: Algebra.Operation,
     endpoint: string,
@@ -184,7 +173,7 @@ export class QuerySourcePassage implements IQuerySource {
     const shouldStopShared: any = context.get(new ActionContextKey('abort'));
     if (shouldStopShared?.value) {
       QuerySourcePassage.logError(context, operation, 'The query has been aborted early.');
-      return new EmptyIterator<RDF.Bindings>() as BindingsStream;
+      return <BindingsStream> new EmptyIterator<RDF.Bindings>();
     }
 
     this.lastSourceContext = this.context.merge(context);
@@ -209,7 +198,7 @@ export class QuerySourcePassage implements IQuerySource {
 
     const iterator = wrap<any>(rawStream, { autoStart: false, maxBufferSize: Number.POSITIVE_INFINITY })
       .map<RDF.Bindings>((rawData: Record<string, RDF.Term>) => {
-        const nbResults: number = iterator.getProperty('nbResults') || 0;
+        const nbResults: number = iterator.getProperty('nbResults') ?? 0;
         iterator.setProperty('nbResults', nbResults + 1);
 
         return this.bindingsFactory.bindings(
@@ -227,22 +216,22 @@ export class QuerySourcePassage implements IQuerySource {
       });
 
     const nextPromise: Promise<string | void> = new Promise((resolve, reject) => {
-      rawStream.on('metadata', async(metadata: { next?: string }) => {
+      rawStream.on('metadata', (metadata: { next?: string }) => {
         if (metadata.next) {
           Actor.getContextLogger(this.context)?.info(`Next query to get complete result:\n${metadata.next}`, {});
         }
         resolve(metadata.next);
       });
-      rawStream.on('end', async() => {
+      rawStream.on('end', () => {
         resolve();
       });
-      iterator.on('error', async(error: Error) => {
+      iterator.on('error', (error: Error) => {
         QuerySourcePassage.logError(context, operation, error.message);
         reject(error);
       });
-      iterator.on('end', async() => {
+      iterator.on('end', () => {
         QuerySourcePassage.updateDoneTime(context, operation);
-        QuerySourcePassage.updateNbResults(context, operation, iterator.getProperty('nbResults') || 0);
+        QuerySourcePassage.updateNbResults(context, operation, iterator.getProperty('nbResults') ?? 0);
       });
     });
 
@@ -269,7 +258,7 @@ export class QuerySourcePassage implements IQuerySource {
       // Passage continuations are endpoint-owned SPARQL queries, so querying the
       // same source recursively avoids re-running the whole Comunica pipeline.
       return this.queryBindingsRemote(nextOperation, endpoint, next, variables, context, undefVariables);
-    }), { autoStart: false }) as BindingsStream;
+    }), { autoStart: false });
 
     return iterator.append(nextIterator);
   }
@@ -290,6 +279,7 @@ export class QuerySourcePassage implements IQuerySource {
     return `QuerySourcePassage(${this.url})`;
   }
 
+  // Convert an operation to the SELECT query that Passage should execute.
   private async toSelectQuery(
     context: IActionContext,
     operation: Algebra.Operation,
@@ -307,10 +297,12 @@ export class QuerySourcePassage implements IQuerySource {
     return this.operationToSelectQuery(operation, variables);
   }
 
+  // Wrap non-project algebra in a projection over the in-scope variables.
   private operationToSelectQuery(operation: Algebra.Operation, variables: RDF.Variable[]): Promise<string> {
     return this.operationToQuery(this.algebraFactory.createProject(operation, variables));
   }
 
+  // Use Comunica serialization to convert algebra back into SPARQL.
   private async operationToQuery(operation: Algebra.Operation): Promise<string> {
     return (await this.mediatorQuerySerialize.mediate({
       queryFormat: { language: 'sparql', version: '1.2' },
@@ -321,6 +313,7 @@ export class QuerySourcePassage implements IQuerySource {
     })).query;
   }
 
+  // Create a physical query-plan node for a Passage remote request.
   public static initializeLogger(context: IActionContext, operation: Algebra.Operation, query: string): void {
     const physicalQueryPlanLogger = context.get(KeysInitQuery.physicalQueryPlanLogger);
     if (!physicalQueryPlanLogger) {
@@ -340,19 +333,21 @@ export class QuerySourcePassage implements IQuerySource {
     );
   }
 
+  // Record when the remote Passage request starts.
   public static updateStartTime(context: IActionContext, operation: Algebra.Operation): void {
     const physicalQueryPlanLogger = QuerySourcePassage.getPhysicalQueryPlanLogger(context);
     if (physicalQueryPlanLogger) {
-      const node = operation as Record<string, any>;
+      const node = <Record<string, any>> operation;
       node.startAt = Date.now();
       physicalQueryPlanLogger.appendMetadata(operation, { startAt: node.startAt });
     }
   }
 
+  // Record time to first result for benchmark timing output.
   public static updateFirstResultTime(context: IActionContext, operation: Algebra.Operation): void {
     const physicalQueryPlanLogger = QuerySourcePassage.getPhysicalQueryPlanLogger(context);
     if (physicalQueryPlanLogger) {
-      const node = operation as Record<string, any>;
+      const node = <Record<string, any>> operation;
       node.firstResultAt = Date.now();
       node.timeFirstResult = node.firstResultAt - node.startAt;
       physicalQueryPlanLogger.appendMetadata(operation, { firstResultAt: node.firstResultAt });
@@ -360,10 +355,11 @@ export class QuerySourcePassage implements IQuerySource {
     }
   }
 
+  // Record completion time for benchmark timing output.
   public static updateDoneTime(context: IActionContext, operation: Algebra.Operation): void {
     const physicalQueryPlanLogger = QuerySourcePassage.getPhysicalQueryPlanLogger(context);
     if (physicalQueryPlanLogger) {
-      const node = operation as Record<string, any>;
+      const node = <Record<string, any>> operation;
       node.doneAt = Date.now();
       node.timeLife = node.doneAt - node.startAt;
       physicalQueryPlanLogger.appendMetadata(operation, { doneAt: node.doneAt });
@@ -371,15 +367,17 @@ export class QuerySourcePassage implements IQuerySource {
     }
   }
 
+  // Store the final number of returned bindings in the query-plan logger.
   public static updateNbResults(context: IActionContext, operation: Algebra.Operation, nbResults: number): void {
     const physicalQueryPlanLogger = QuerySourcePassage.getPhysicalQueryPlanLogger(context);
     if (physicalQueryPlanLogger) {
-      const node = operation as Record<string, any>;
+      const node = <Record<string, any>> operation;
       node.cardinalityReal = nbResults;
       physicalQueryPlanLogger.appendMetadata(operation, { cardinalityReal: nbResults });
     }
   }
 
+  // Mark a Passage plan node as failed with the provided message.
   public static logError(context: IActionContext, operation: Algebra.Operation, message: string): void {
     const physicalQueryPlanLogger = QuerySourcePassage.getPhysicalQueryPlanLogger(context);
     if (physicalQueryPlanLogger) {
@@ -387,8 +385,23 @@ export class QuerySourcePassage implements IQuerySource {
     }
   }
 
+  // Find the physical query-plan logger across supported context keys.
   private static getPhysicalQueryPlanLogger(context: IActionContext): IPhysicalQueryPlanLogger | undefined {
     return context.get(KeysInitQuery.physicalQueryPlanLogger) ??
       context.get(new ActionContextKey<IPhysicalQueryPlanLogger>('physicalQueryPlanLogger'));
   }
+}
+
+// Resolve the Passage selector shape from the SHAPE environment override.
+function getDefaultSelectorShape(): FragmentSelectorShape {
+  if (process.env.SHAPE === 'tpf') {
+    return Shapes.TPF;
+  }
+  if (process.env.SHAPE === 'brtpf') {
+    return Shapes.BRTPF;
+  }
+  if (process.env.SHAPE === 'no-union') {
+    return Shapes.PASSAGE_NO_UNION;
+  }
+  return Shapes.PASSAGE;
 }

@@ -9,7 +9,7 @@ import {
   readSync,
   writeFileSync,
 } from 'node:fs';
-import { isAbsolute, join } from 'node:path';
+import { basename, isAbsolute, join } from 'node:path';
 import type { MediatorHttp } from '@comunica/bus-http';
 import { ActorHttp } from '@comunica/bus-http';
 import type {
@@ -790,13 +790,20 @@ export class QuerySourceSmartKg implements IQuerySource {
       return family.name;
     }
 
-    const partitionUrl = `${this.partitionsBaseUrl}/${family.name}`;
+    const partitionName = basename(family.name);
+    if (!partitionName || partitionName === '.') {
+      throw new Error(`SmartKG family has no valid partition filename: ${family.name}`);
+    }
+    const partitionUrl = `${this.partitionsBaseUrl}/${encodeURIComponent(partitionName)}`;
     const partitionPath = join(this.cacheFolder, encodeURIComponent(partitionUrl));
     if (isHdtFile(partitionPath)) {
       return partitionPath;
     }
 
     const response = await this.mediatorHttp.mediate({ context: this.defaultContext, input: partitionUrl });
+    if (!response.ok) {
+      throw new Error(`SmartKG partition download failed with HTTP ${response.status}: ${partitionUrl}`);
+    }
     const body = ActorHttp.toNodeReadable(response.body);
     const payload = await readStreamToBuffer(body);
     writePartitionPayload(partitionPath, payload);
@@ -810,6 +817,9 @@ export class QuerySourceSmartKg implements IQuerySource {
     }
 
     const response = await this.mediatorHttp.mediate({ context: this.defaultContext, input: url });
+    if (!response.ok) {
+      throw new Error(`SmartKG metadata download failed with HTTP ${response.status}: ${url}`);
+    }
     const body = ActorHttp.toNodeReadable(response.body);
     const content = await readStreamToString(body);
     await new Promise<void>((resolve, reject) => {
@@ -1374,8 +1384,10 @@ function writePartitionPayload(partitionPath: string, payload: Buffer): void {
   const entries = extractTarEntries(payload);
   const hdtEntry = entries.find(entry => entry.name.endsWith('.hdt') && !entry.name.endsWith('.index.v1-1'));
   if (!hdtEntry) {
-    writeFileSync(partitionPath, payload);
-    return;
+    throw new Error('SmartKG partition response did not contain a valid HDT payload.');
+  }
+  if (!isHdtBuffer(hdtEntry.payload)) {
+    throw new Error(`SmartKG partition archive entry is not valid HDT: ${hdtEntry.name}`);
   }
 
   writeFileSync(partitionPath, hdtEntry.payload);

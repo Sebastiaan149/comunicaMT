@@ -51,6 +51,7 @@ type HdtDocument = {
   ) => Promise<{ bindings?: RDF.Bindings[] }>;
 };
 let hdtModulePromise: Promise<{ fromFile: (path: string) => Promise<HdtDocument> }> | undefined;
+const partitionDownloadPromises = new Map<string, Promise<string>>();
 
 async function loadHdtModule(): Promise<{ fromFile: (path: string) => Promise<HdtDocument> }> {
   if (!hdtModulePromise) {
@@ -988,6 +989,23 @@ export class QuerySourceSmartKg implements IQuerySource {
       return partitionPath;
     }
 
+    const existingDownload = partitionDownloadPromises.get(partitionPath);
+    if (existingDownload) {
+      return existingDownload;
+    }
+
+    const download = this.downloadPartitionFile(partitionUrl, partitionPath);
+    partitionDownloadPromises.set(partitionPath, download);
+    try {
+      return await download;
+    } finally {
+      if (partitionDownloadPromises.get(partitionPath) === download) {
+        partitionDownloadPromises.delete(partitionPath);
+      }
+    }
+  }
+
+  private async downloadPartitionFile(partitionUrl: string, partitionPath: string): Promise<string> {
     const response = await this.mediatorHttp.mediate({ context: this.defaultContext, input: partitionUrl });
     if (!response.ok) {
       throw new Error(`SmartKG partition download failed with HTTP ${response.status}: ${partitionUrl}`);

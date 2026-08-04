@@ -3,6 +3,7 @@ import { KeysInitQuery } from '@comunica/context-entries';
 import { ActionContext } from '@comunica/core';
 import { AlgebraFactory } from '@comunica/utils-algebra';
 import { BindingsFactory } from '@comunica/utils-bindings-factory';
+import { ArrayIterator } from 'asynciterator';
 import { DataFactory } from 'rdf-data-factory';
 import { QuerySourceWiseKg } from '../../lib/QuerySourceWiseKg';
 
@@ -87,7 +88,7 @@ describe('QuerySourceWiseKg', () => {
       .toBe('http://localhost:8080/molecule/smartkg/35.hdt');
   });
 
-  it('should evaluate wisekg controls through the original source path', async() => {
+  it('should evaluate wisekg controls through the server source path', async() => {
     const source = createSource();
     const sourceAny = <any> source;
     const input = [ await sourceAny.emptyBinding() ];
@@ -96,16 +97,58 @@ describe('QuerySourceWiseKg', () => {
       rating: DF.literal('5'),
     });
 
-    jest.spyOn(sourceAny, 'queryStarViaOriginalSource').mockImplementation(async() => [ sourceResult ]);
+    jest.spyOn(sourceAny, 'queryStarViaControlledSource').mockImplementation(async() => [ sourceResult ]);
     jest.spyOn(sourceAny, 'fetchPartitionFileByControl').mockImplementation();
 
     const starPatterns = sourceAny.wiseKgStarToPatterns(wisekgStep.star);
     const results = await sourceAny.evaluateWiseKgStep(wisekgStep, starPatterns, input, context);
 
-    expect(sourceAny.queryStarViaOriginalSource).toHaveBeenCalledTimes(1);
+    expect(sourceAny.queryStarViaControlledSource).toHaveBeenCalledTimes(1);
     expect(sourceAny.fetchPartitionFileByControl).toHaveBeenCalledTimes(0);
     expect(results).toHaveLength(1);
     expect(results[0].get(DF.variable('rating'))?.equals(DF.literal('5'))).toBe(true);
+  });
+
+  it('should distinguish server-side partition controls from molecule shipping controls', () => {
+    const sourceAny = <any> createSource();
+
+    expect(sourceAny.isServerSourceControl('http://localhost:8080/partition/35')).toBe(true);
+    expect(sourceAny.isPartitionShippingControl('http://localhost:8080/partition/35')).toBe(false);
+    expect(sourceAny.isServerSourceControl('http://localhost:8080/molecule/wisekg/35.hdt')).toBe(false);
+    expect(sourceAny.isPartitionShippingControl('http://localhost:8080/molecule/wisekg/35.hdt')).toBe(true);
+  });
+
+  it('should pass incoming bindings to server-side partition controls through SPF', async() => {
+    const sourceAny = <any> createSource();
+    const input = BF.fromRecord({ review: DF.namedNode('http://example.org/review') });
+    const output = BF.fromRecord({
+      item: DF.namedNode('http://example.org/item'),
+      review: DF.namedNode('http://example.org/review'),
+    });
+    const queryForcedSourceBindings = jest.spyOn(sourceAny, 'queryForcedSourceBindings')
+      .mockImplementation(async() => new ArrayIterator([ output ], { autoStart: false }));
+    const step = {
+      control: 'http://localhost:8080/partition/35',
+      star: {
+        subject: '?item',
+        triples: [
+          { x: 'http://purl.org/stuff/rev#hasReview', y: '?review' },
+        ],
+      },
+    };
+
+    const results = await sourceAny.queryStarViaControlledSource(
+      sourceAny.wiseKgStarToPatterns(step.star),
+      [ input ],
+      step.control,
+      context,
+    );
+
+    expect(queryForcedSourceBindings).toHaveBeenCalledTimes(1);
+    expect(queryForcedSourceBindings.mock.calls[0][4]).toBe('spf');
+    const queryOptions = <any> queryForcedSourceBindings.mock.calls[0][2];
+    expect(queryOptions.joinBindings.metadata.cardinality.value).toBe(1);
+    expect(results).toEqual([ output ]);
   });
 
   it('should fall back when /plan returns invalid JSON', async() => {

@@ -81,13 +81,16 @@ function createMetadataValidationState(): MetadataBindings['state'] {
 
 class HdtDocumentCache {
   private readonly cache = new Map<string, Promise<HdtDocument>>();
+  private opening: Promise<void> = Promise.resolve();
 
   public async getDocument(path: string): Promise<HdtDocument> {
     const existing = this.cache.get(path);
     if (existing) {
       return existing;
     }
-    const documentPromise = loadHdtModule().then(hdt => hdt.fromFile(path));
+    // The native HDT index builder is not safe when multiple unindexed partitions are opened concurrently.
+    const documentPromise = this.opening.then(async() => (await loadHdtModule()).fromFile(path));
+    this.opening = documentPromise.then(() => {}, () => {});
     this.cache.set(path, documentPromise);
     return documentPromise;
   }
@@ -122,6 +125,41 @@ class ArrayBindingsIterator extends BufferedIterator<RDF.Bindings> {
     } catch (error) {
       this.destroy(<Error> error);
     }
+  }
+
+  public override _read(_count: number, done: () => void): void {
+    done();
+  }
+}
+
+class StreamingBindingsIterator extends BufferedIterator<RDF.Bindings> {
+  private emitted = 0;
+  private readonly state = createMetadataValidationState();
+
+  public constructor(
+    producer: (emit: (binding: RDF.Bindings) => void) => Promise<void>,
+    private readonly variables: MetadataBindings['variables'],
+  ) {
+    super({ autoStart: true, maxBufferSize: 256 });
+    this.setProperty('metadata', {
+      state: this.state,
+      cardinality: { type: 'estimate', value: Number.POSITIVE_INFINITY },
+      variables,
+      next: [],
+    } satisfies MetadataBindings);
+    producer((binding) => {
+      this.emitted++;
+      this._push(binding);
+    }).then(() => {
+      this.setProperty('metadata', {
+        state: createMetadataValidationState(),
+        cardinality: { type: 'exact', value: this.emitted },
+        variables: this.variables,
+        next: [],
+      } satisfies MetadataBindings);
+      this.state.invalidate();
+      this.close();
+    }).catch(error => this.destroy(<Error> error));
   }
 
   public override _read(_count: number, done: () => void): void {
@@ -220,7 +258,10 @@ export class QuerySourceSmartKg implements IQuerySource {
   ): BindingsStream {
     const variables = getOperationVariables(operation);
     return <BindingsStream><unknown>
-      new ArrayBindingsIterator(this.evaluateOperation(operation, context, options), variables);
+      new StreamingBindingsIterator(
+        emit => this.streamOperation(operation, context, options, emit),
+        variables,
+      );
   }
 
   public queryQuads(_operation: Algebra.Operation, _context: IActionContext): AsyncIterator<RDF.Quad> {
@@ -258,6 +299,57 @@ export class QuerySourceSmartKg implements IQuerySource {
       return this.evaluateStarJoin(operation, context, options);
     }
     throw new Error(`Unsupported operation type '${operation.type}' for QuerySourceSmartKg.`);
+  }
+
+  private async streamOperation(
+    operation: Algebra.Operation,
+    context: IActionContext,
+    options: IQueryBindingsOptions | undefined,
+    emit: (binding: RDF.Bindings) => void,
+  ): Promise<void> {
+    if (isKnownOperation(operation, Algebra.Types.BGP)) {
+      await this.streamPatternsByStars(operation.patterns, context, options, emit);
+      return;
+    }
+    if (isKnownOperation(operation, Algebra.Types.JOIN)) {
+      const patterns = collectPatterns(operation);
+      if (patterns.length === 0) {
+        throw new Error(`Unsupported non-pattern operation '${operation.type}' in QuerySourceSmartKg join.`);
+      }
+      await this.streamPatternsByStars(patterns, context, options, emit);
+      return;
+    }
+
+    for (const binding of await this.evaluateOperation(operation, context, options)) {
+      emit(binding);
+    }
+  }
+
+  private async streamPatternsByStars(
+    patterns: Algebra.Pattern[],
+    context: IActionContext,
+    options: IQueryBindingsOptions | undefined,
+    emit: (binding: RDF.Bindings) => void,
+  ): Promise<void> {
+    const stars = groupPatternsBySubject(patterns);
+    let results: RDF.Bindings[] = [ await this.emptyBinding() ];
+
+    for (const [ index, starPatterns ] of stars.entries()) {
+      if (index === stars.length - 1 && starPatterns.length === 1 &&
+        !await this.shouldUsePartitions(starPatterns[0], context)) {
+        await this.streamJoinedFallbackBindings(results, starPatterns[0], context, options, emit);
+        return;
+      }
+      const starResults = await this.evaluateStar(starPatterns, context, options);
+      if (index === stars.length - 1) {
+        await this.emitJoinedBindings(results, starResults, emit);
+        return;
+      }
+      results = await this.joinBindingsLists(results, starResults);
+      if (results.length === 0) {
+        return;
+      }
+    }
   }
 
   private async evaluateBgp(
@@ -445,7 +537,7 @@ export class QuerySourceSmartKg implements IQuerySource {
       return this.queryPatternsViaAllPartitionFamilies(patterns, metadata);
     }
 
-    if (await this.shouldPreferOriginalSourceStar(patterns, scopedFamilies, context)) {
+    if (!this.smartKgPlusSource && await this.shouldPreferOriginalSourceStar(patterns, scopedFamilies, context)) {
       return this.queryPatternsViaOriginalSource(patterns, context, options);
     }
 
@@ -777,6 +869,102 @@ export class QuerySourceSmartKg implements IQuerySource {
     return deduplicateBindings(results);
   }
 
+  private async streamJoinedFallbackBindings(
+    leftBindings: RDF.Bindings[],
+    operation: Algebra.Operation,
+    context: IActionContext,
+    options: IQueryBindingsOptions | undefined,
+    emit: (binding: RDF.Bindings) => void,
+  ): Promise<void> {
+    if (!this.mediatorQuerySourceDereferenceLink) {
+      return;
+    }
+
+    const fallbackContext = setContextFlag(context, 'smartkgFallback', true);
+    const handledDatasets: Record<string, boolean> = {};
+    const queuedLinks = [ this.originalSourceUrl ];
+    const seenLinks = new Set<string>();
+    const seenBindings = new Set<string>();
+    const bindingsFactory = await this.getBindingsFactory();
+    const leftRecords = leftBindings.map(bindingToRecord);
+    const sharedVariables = getOperationVariables(operation)
+      .map(({ variable }) => variable.value)
+      .filter(variable => leftRecords.every(record => Boolean(record[variable])));
+    const leftIndex = new Map<string, Record<string, RDF.Term>[]>();
+    if (sharedVariables.length > 0) {
+      for (const leftRecord of leftRecords) {
+        const key = joinKey(leftRecord, sharedVariables);
+        const bucket = leftIndex.get(key) ?? [];
+        bucket.push(leftRecord);
+        leftIndex.set(key, bucket);
+      }
+    }
+
+    while (queuedLinks.length > 0) {
+      const nextUrl = queuedLinks.shift()!;
+      if (seenLinks.has(nextUrl)) {
+        continue;
+      }
+      seenLinks.add(nextUrl);
+
+      const sourceResult = await this.mediatorQuerySourceDereferenceLink.mediate({
+        context: fallbackContext,
+        link: { url: nextUrl },
+        handledDatasets,
+      });
+      const source = sourceResult?.source;
+      if (!source || typeof source.queryBindings !== 'function') {
+        continue;
+      }
+
+      const stream = source.queryBindings(operation, fallbackContext, options);
+      let metadata: MetadataBindings | undefined;
+      let resolveMetadata: (metadata?: MetadataBindings) => void = () => {};
+      const metadataPromise = new Promise<MetadataBindings | undefined>((resolve) => {
+        resolveMetadata = resolve;
+      });
+      if (typeof stream.getProperty === 'function') {
+        stream.getProperty('metadata', (value: MetadataBindings) => {
+          metadata = value;
+          resolveMetadata(value);
+        });
+      } else {
+        resolveMetadata();
+      }
+      for await (const rightBinding of stream) {
+        const rightRecord = bindingToRecord(rightBinding);
+        const candidates = sharedVariables.length > 0 &&
+          sharedVariables.every(variable => Boolean(rightRecord[variable])) ?
+          leftIndex.get(joinKey(rightRecord, sharedVariables)) ?? [] :
+          leftRecords;
+        for (const leftRecord of candidates) {
+          if (areBindingRecordsCompatible(leftRecord, rightRecord)) {
+            const binding = bindingsFactory.fromRecord({ ...leftRecord, ...rightRecord });
+            const key = bindingKey(binding);
+            if (!seenBindings.has(key)) {
+              seenBindings.add(key);
+              emit(binding);
+            }
+          }
+        }
+      }
+      if (!metadata) {
+        await Promise.race([
+          metadataPromise,
+          new Promise(resolve => setImmediate(resolve)),
+        ]);
+      }
+
+      const streamNextLinks = getMetadataNextLinks(metadata);
+      const nextLinks = streamNextLinks.length > 0 ? streamNextLinks : getMetadataNextLinks(sourceResult.metadata);
+      for (const link of nextLinks) {
+        if (!seenLinks.has(link) && !isDatasetPageLink(link, this.originalSourceUrl)) {
+          queuedLinks.push(link);
+        }
+      }
+    }
+  }
+
   private async fetchMetadata(): Promise<ISmartKgMetadata> {
     if (!this.metadata) {
       const metadataString = await this.fetchText(this.metadataUrl);
@@ -807,6 +995,16 @@ export class QuerySourceSmartKg implements IQuerySource {
     const body = ActorHttp.toNodeReadable(response.body);
     const payload = await readStreamToBuffer(body);
     writePartitionPayload(partitionPath, payload);
+    if (!existsSync(`${partitionPath}.index.v1-1`)) {
+      const indexResponse = await this.mediatorHttp.mediate({
+        context: this.defaultContext,
+        input: `${partitionUrl}.index.v1-1`,
+      });
+      if (indexResponse.ok) {
+        const indexBody = ActorHttp.toNodeReadable(indexResponse.body);
+        writeFileSync(`${partitionPath}.index.v1-1`, await readStreamToBuffer(indexBody));
+      }
+    }
     return partitionPath;
   }
 
@@ -903,6 +1101,26 @@ export class QuerySourceSmartKg implements IQuerySource {
   private async joinBindingsLists(left: RDF.Bindings[], right: RDF.Bindings[]): Promise<RDF.Bindings[]> {
     const bindingsFactory = await this.getBindingsFactory();
     return joinBindingRecords(left.map(bindingToRecord), right.map(bindingToRecord), bindingsFactory);
+  }
+
+  private async emitJoinedBindings(
+    left: RDF.Bindings[],
+    right: RDF.Bindings[],
+    emit: (binding: RDF.Bindings) => void,
+  ): Promise<void> {
+    const bindingsFactory = await this.getBindingsFactory();
+    const seen = new Set<string>();
+    for (const binding of joinBindingRecordsIterator(
+      left.map(bindingToRecord),
+      right.map(bindingToRecord),
+      bindingsFactory,
+    )) {
+      const key = bindingKey(binding);
+      if (!seen.has(key)) {
+        seen.add(key);
+        emit(binding);
+      }
+    }
   }
 }
 
@@ -1030,20 +1248,28 @@ function joinBindingRecords(
   rightRecords: Record<string, RDF.Term>[],
   bindingsFactory: BindingsFactory,
 ): RDF.Bindings[] {
+  return [ ...joinBindingRecordsIterator(leftRecords, rightRecords, bindingsFactory) ];
+}
+
+function* joinBindingRecordsIterator(
+  leftRecords: Record<string, RDF.Term>[],
+  rightRecords: Record<string, RDF.Term>[],
+  bindingsFactory: BindingsFactory,
+): IterableIterator<RDF.Bindings> {
   if (leftRecords.length === 0 || rightRecords.length === 0) {
-    return [];
+    return;
   }
 
   const sharedVariables = getSharedBoundVariables(leftRecords, rightRecords);
   if (sharedVariables.length === 0) {
-    return nestedJoinBindingRecords(leftRecords, rightRecords, bindingsFactory);
+    yield* nestedJoinBindingRecordsIterator(leftRecords, rightRecords, bindingsFactory);
+    return;
   }
 
   const indexedIsLeft = leftRecords.length <= rightRecords.length;
   const indexed = indexedIsLeft ? leftRecords : rightRecords;
   const probes = indexedIsLeft ? rightRecords : leftRecords;
   const index = new Map<string, Record<string, RDF.Term>[]>();
-  const results: RDF.Bindings[] = [];
 
   for (const record of indexed) {
     const key = joinKey(record, sharedVariables);
@@ -1064,28 +1290,24 @@ function joinBindingRecords(
       const leftMap = indexedIsLeft ? candidate : probe;
       const rightMap = indexedIsLeft ? probe : candidate;
       if (areBindingRecordsCompatible(leftMap, rightMap)) {
-        results.push(bindingsFactory.fromRecord({ ...leftMap, ...rightMap }));
+        yield bindingsFactory.fromRecord({ ...leftMap, ...rightMap });
       }
     }
   }
-
-  return results;
 }
 
-function nestedJoinBindingRecords(
+function* nestedJoinBindingRecordsIterator(
   leftRecords: Record<string, RDF.Term>[],
   rightRecords: Record<string, RDF.Term>[],
   bindingsFactory: BindingsFactory,
-): RDF.Bindings[] {
-  const results: RDF.Bindings[] = [];
+): IterableIterator<RDF.Bindings> {
   for (const leftMap of leftRecords) {
     for (const rightMap of rightRecords) {
       if (areBindingRecordsCompatible(leftMap, rightMap)) {
-        results.push(bindingsFactory.fromRecord({ ...leftMap, ...rightMap }));
+        yield bindingsFactory.fromRecord({ ...leftMap, ...rightMap });
       }
     }
   }
-  return results;
 }
 
 function getSharedBoundVariables(
@@ -1121,6 +1343,24 @@ function deduplicateBindings(bindings: RDF.Bindings[]): RDF.Bindings[] {
     results.push(binding);
   }
   return results;
+}
+
+function bindingKey(binding: RDF.Bindings): string {
+  return [ ...binding ]
+    .map(([ variable, value ]) => `${variable.value}=${termToString(value)}`)
+    .sort()
+    .join('|');
+}
+
+function groupPatternsBySubject(patterns: Algebra.Pattern[]): Algebra.Pattern[][] {
+  const stars = new Map<string, Algebra.Pattern[]>();
+  for (const pattern of patterns) {
+    const subject = termToString(pattern.subject);
+    const bucket = stars.get(subject) ?? [];
+    bucket.push(pattern);
+    stars.set(subject, bucket);
+  }
+  return [ ...stars.values() ];
 }
 
 function getMetadataNextLinks(metadata: MetadataBindings | Record<string, unknown> | undefined): string[] {

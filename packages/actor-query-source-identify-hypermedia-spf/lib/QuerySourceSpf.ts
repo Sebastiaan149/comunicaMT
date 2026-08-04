@@ -125,10 +125,12 @@ export class QuerySourceSpf implements IQuerySource {
         {
           type: 'operation',
           operation: { operationType: 'type', type: Algebra.Types.BGP },
+          joinBindings: true,
         },
         {
           type: 'operation',
           operation: { operationType: 'type', type: Algebra.Types.JOIN },
+          joinBindings: true,
         },
       ],
     };
@@ -147,15 +149,18 @@ export class QuerySourceSpf implements IQuerySource {
   public queryBindings(
     operation: Algebra.Operation,
     context: IActionContext,
-    _options?: IQueryBindingsOptions,
+    options?: IQueryBindingsOptions,
   ): BindingsStream {
     const patterns = this.getOperationPatterns(operation);
     const bgp = this.algebraFactory.createBgp(patterns);
     const variables = getOperationVariables(bgp);
+    const rootIterator: IBindingChunkIterator = options?.joinBindings ?
+      new BindingsStreamChunkIterator(options.joinBindings.bindings, this.maxMpR) :
+      new RootBindingChunkIterator(this.bindingsFactory.bindings());
     return <BindingsStream> <unknown> new SpfBindingsIterator(
       Promise.resolve(new QueryIterator(
         new BasicGraphPatternIterator(
-          new RootBindingChunkIterator(this.bindingsFactory.bindings()),
+          rootIterator,
           decomposeSubjectStars(bgp.patterns),
           this,
           context,
@@ -422,6 +427,27 @@ class RootBindingChunkIterator implements IBindingChunkIterator {
     }
     this.emitted = true;
     return [ this.emptyBinding ];
+  }
+}
+
+// Reads incoming join bindings in bounded chunks for SPF VALUES requests.
+class BindingsStreamChunkIterator implements IBindingChunkIterator {
+  private readonly iterator: AsyncIterator<RDF.Bindings>;
+
+  public constructor(bindings: BindingsStream, private readonly chunkSize: number) {
+    this.iterator = bindings[Symbol.asyncIterator]();
+  }
+
+  public async getNext(): Promise<BindingChunk | undefined> {
+    const bindings: RDF.Bindings[] = [];
+    while (bindings.length < this.chunkSize) {
+      const next = await this.iterator.next();
+      if (next.done) {
+        break;
+      }
+      bindings.push(next.value);
+    }
+    return bindings.length > 0 ? bindings : undefined;
   }
 }
 

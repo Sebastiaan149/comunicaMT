@@ -38,14 +38,14 @@ export function flattenWiseKgPlan(plan: IWiseKgPlanNode): IWiseKgExecutableStep[
       return;
     }
 
+    visit(node.subplan);
+
     if (isWiseKgPlanOperator(node.operator)) {
       steps.push({
         control: node.operator.control,
         star: node.operator.star,
       });
     }
-
-    visit(node.subplan);
   };
 
   visit(plan);

@@ -36,16 +36,16 @@ const examplePlan: IWiseKgPlanNode = {
 
 describe('WiseKgPlan', () => {
   describe('#flattenWiseKgPlan', () => {
-    it('should flatten root-first annotated plan steps', () => {
+    it('should flatten the first planned subplan before its parent', () => {
       const steps = flattenWiseKgPlan(examplePlan);
 
       expect(steps).toHaveLength(2);
-      expect(steps[0].control).toBe('partition/35');
-      expect(steps[0].star.subject).toBe('?item');
-      expect(steps[0].star.triples).toHaveLength(5);
-      expect(steps[1].control).toBe('wisekg');
-      expect(steps[1].star.subject).toBe('?review');
-      expect(steps[1].star.triples).toHaveLength(1);
+      expect(steps[0].control).toBe('wisekg');
+      expect(steps[0].star.subject).toBe('?review');
+      expect(steps[0].star.triples).toHaveLength(1);
+      expect(steps[1].control).toBe('partition/35');
+      expect(steps[1].star.subject).toBe('?item');
+      expect(steps[1].star.triples).toHaveLength(5);
     });
   });
 

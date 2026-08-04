@@ -138,6 +138,42 @@ class ArrayBindingsIterator extends BufferedIterator<RDF.Bindings> {
   }
 }
 
+// Emits final bindings as soon as the plan executor produces them.
+class StreamingBindingsIterator extends BufferedIterator<RDF.Bindings> {
+  private emitted = 0;
+  private readonly state = createMetadataValidationState();
+
+  public constructor(
+    producer: (emit: (binding: RDF.Bindings) => void) => Promise<void>,
+    private readonly variables: MetadataBindings['variables'],
+  ) {
+    super({ autoStart: true, maxBufferSize: 256 });
+    this.setProperty('metadata', {
+      state: this.state,
+      cardinality: { type: 'estimate', value: Number.POSITIVE_INFINITY },
+      variables,
+      next: [],
+    } satisfies MetadataBindings);
+    producer((binding) => {
+      this.emitted++;
+      this._push(binding);
+    }).then(() => {
+      this.setProperty('metadata', {
+        state: createMetadataValidationState(),
+        cardinality: { type: 'exact', value: this.emitted },
+        variables: this.variables,
+        next: [],
+      } satisfies MetadataBindings);
+      this.state.invalidate();
+      this.close();
+    }).catch(error => this.destroy(<Error> error));
+  }
+
+  public override _read(_count: number, done: () => void): void {
+    done();
+  }
+}
+
 // Query source that executes WiseKG plans with local HDT partitions and fallback requests.
 export class QuerySourceWiseKg implements IQuerySource {
   public readonly referenceValue: string;
@@ -224,7 +260,7 @@ export class QuerySourceWiseKg implements IQuerySource {
     return this.selectorShape;
   }
 
-  // Evaluate the operation and stream the collected bindings.
+  // Evaluate the operation and emit final bindings incrementally.
   public queryBindings(
     operation: Algebra.Operation,
     context: IActionContext,
@@ -232,7 +268,10 @@ export class QuerySourceWiseKg implements IQuerySource {
   ): BindingsStream {
     const variables = getOperationVariables(operation);
     return <BindingsStream> <unknown>
-      new ArrayBindingsIterator(this.evaluateOperation(operation, context, options), variables);
+      new StreamingBindingsIterator(
+        emit => this.streamOperation(operation, context, options, emit),
+        variables,
+      );
   }
 
   // Return no quads because WiseKG evaluation produces bindings.
@@ -277,6 +316,30 @@ export class QuerySourceWiseKg implements IQuerySource {
       return this.evaluatePatternsByPlan(patterns, context, options);
     }
     throw new Error(`Unsupported operation type '${operation.type}' for QuerySourceWiseKg.`);
+  }
+
+  private async streamOperation(
+    operation: Algebra.Operation,
+    context: IActionContext,
+    options: IQueryBindingsOptions | undefined,
+    emit: (binding: RDF.Bindings) => void,
+  ): Promise<void> {
+    const patterns = isKnownOperation(operation, Algebra.Types.PATTERN) ?
+        [ operation ] :
+      collectPatterns(operation);
+    if (patterns.length === 0) {
+      throw new Error(`Unsupported operation type '${operation.type}' for QuerySourceWiseKg.`);
+    }
+
+    const fetchedPlan = patterns.length > 1 ? await this.fetchWiseKgPlan(patterns, context) : undefined;
+    if (fetchedPlan) {
+      await this.executeWiseKgPlanStreaming(patterns, fetchedPlan, context, options, emit);
+      return;
+    }
+
+    for (const binding of await this.queryStarViaOriginalSourceWithRetry(patterns, context, options)) {
+      emit(binding);
+    }
   }
 
   // Fetch a WiseKG plan for a BGP and execute it.
@@ -404,7 +467,7 @@ export class QuerySourceWiseKg implements IQuerySource {
     return termToString(term);
   }
 
-  // Execute all fetched plan steps and join their results in selective order.
+  // Execute the server-ordered plan and pass each step's bindings to the next.
   private async executeWiseKgPlan(
     _originalPatterns: Algebra.Pattern[],
     fetchedPlan: IWiseKgFetchedPlan,
@@ -424,24 +487,45 @@ export class QuerySourceWiseKg implements IQuerySource {
       }
     }
 
-    const evaluatedSteps = await Promise.all(steps.map(async(step) => {
-      const starPatterns = this.wiseKgStarToPatterns(step.star);
-      return {
-        step,
-        results: await this.evaluateWiseKgStepResults(step, starPatterns, context, options),
-      };
-    }));
-    evaluatedSteps.sort((left, right) => left.results.length - right.results.length);
-
     let results: RDF.Bindings[] = [ await this.emptyBinding() ];
-    for (const evaluatedStep of evaluatedSteps) {
-      results = this.deduplicateBindings(await this.joinBindingsLists(results, evaluatedStep.results));
+    for (const step of steps) {
+      const starPatterns = this.wiseKgStarToPatterns(step.star);
+      results = await this.evaluateWiseKgStep(step, starPatterns, results, context, options);
       if (results.length === 0) {
         break;
       }
     }
 
     return this.deduplicateBindings(results);
+  }
+
+  private async executeWiseKgPlanStreaming(
+    originalPatterns: Algebra.Pattern[],
+    fetchedPlan: IWiseKgFetchedPlan,
+    context: IActionContext,
+    options: IQueryBindingsOptions | undefined,
+    emit: (binding: RDF.Bindings) => void,
+  ): Promise<void> {
+    let steps = [ ...fetchedPlan.steps ];
+    if (fetchedPlan.expiresAt && Date.now() > fetchedPlan.expiresAt) {
+      const newPlan = await this.fetchWiseKgPlan(originalPatterns, context);
+      if (newPlan) {
+        steps = [ ...newPlan.steps ];
+      }
+    }
+
+    let results: RDF.Bindings[] = [ await this.emptyBinding() ];
+    for (const [ index, step ] of steps.entries()) {
+      const starPatterns = this.wiseKgStarToPatterns(step.star);
+      if (index === steps.length - 1) {
+        await this.streamWiseKgStep(step, starPatterns, results, context, options, emit);
+        return;
+      }
+      results = await this.evaluateWiseKgStep(step, starPatterns, results, context, options);
+      if (results.length === 0) {
+        return;
+      }
+    }
   }
 
   // Execute one plan step and join it with the incoming bindings.
@@ -452,31 +536,91 @@ export class QuerySourceWiseKg implements IQuerySource {
     context: IActionContext,
     options?: IQueryBindingsOptions,
   ): Promise<RDF.Bindings[]> {
-    const stepResults = await this.evaluateWiseKgStepResults(step, starPatterns, context, options);
-    return this.deduplicateBindings(await this.joinBindingsLists(inputBindings, stepResults));
-  }
-
-  // Evaluate a plan step through a local partition or the original source.
-  private async evaluateWiseKgStepResults(
-    step: IWiseKgExecutableStep,
-    starPatterns: Algebra.Pattern[],
-    context: IActionContext,
-    options?: IQueryBindingsOptions,
-  ): Promise<RDF.Bindings[]> {
-    if (this.isPartitionControl(step.control)) {
+    if (this.isPartitionShippingControl(step.control)) {
       const partitionUrl = this.getPartitionHdtUrlForControl(step.control);
       this.logDebug(context, `WiseKG downloading/evaluating partition ${partitionUrl}`);
       const partitionPath = await this.fetchPartitionFileByControl(step.control);
-      const [ localResults, sourceResults ] = await Promise.all([
-        this.evaluatePatternsOnPartition(partitionPath, starPatterns),
-        this.queryStarViaOriginalSourceWithRetry(starPatterns, context, options),
-      ]);
-      return sourceResults.length > localResults.length ? sourceResults : localResults;
+      const stepResults = await this.evaluatePatternsOnPartition(partitionPath, starPatterns);
+      const localResults = await this.joinBindingsLists(inputBindings, stepResults);
+      const completionResults = await this.queryOriginalStarWithInput(starPatterns, inputBindings, context, options);
+      return this.deduplicateBindings([ ...localResults, ...completionResults ]);
     }
 
-    if (this.isOriginalSourceControl(step.control)) {
-      this.logDebug(context, `WiseKG evaluating step through original source ${this.originalSourceUrl}`);
-      return this.queryStarViaOriginalSourceWithRetry(starPatterns, context, options);
+    if (this.isServerSourceControl(step.control)) {
+      this.logDebug(context, `WiseKG evaluating server-controlled step ${step.control}`);
+      const controlledResults = await this.queryStarViaControlledSource(
+        starPatterns,
+        inputBindings,
+        step.control,
+        context,
+        options,
+      );
+      if (!this.isServerPartitionControl(step.control)) {
+        return controlledResults;
+      }
+      const completionResults = await this.queryOriginalStarWithInput(starPatterns, inputBindings, context, options);
+      return this.deduplicateBindings([ ...controlledResults, ...completionResults ]);
+    }
+
+    throw new Error(`WiseKG encountered unsupported plan control '${step.control}'.`);
+  }
+
+  private async streamWiseKgStep(
+    step: IWiseKgExecutableStep,
+    starPatterns: Algebra.Pattern[],
+    inputBindings: RDF.Bindings[],
+    context: IActionContext,
+    options: IQueryBindingsOptions | undefined,
+    emit: (binding: RDF.Bindings) => void,
+  ): Promise<void> {
+    const seen = new Set<string>();
+    const emitOnce = (binding: RDF.Bindings): void => {
+      const key = bindingKey(binding);
+      if (!seen.has(key)) {
+        seen.add(key);
+        emit(binding);
+      }
+    };
+
+    if (this.isPartitionShippingControl(step.control)) {
+      const partitionUrl = this.getPartitionHdtUrlForControl(step.control);
+      this.logDebug(context, `WiseKG downloading/evaluating partition ${partitionUrl}`);
+      const partitionPath = await this.fetchPartitionFileByControl(step.control);
+      const stepResults = await this.evaluatePatternsOnPartition(partitionPath, starPatterns);
+      await this.emitJoinedBindings(inputBindings, stepResults, emitOnce);
+      for (const binding of await this.queryOriginalStarWithInput(starPatterns, inputBindings, context, options)) {
+        emitOnce(binding);
+      }
+      return;
+    }
+
+    if (this.isServerSourceControl(step.control)) {
+      if (this.isServerPartitionControl(step.control)) {
+        const stream = await this.queryPartitionStarBindings(
+          starPatterns,
+          inputBindings,
+          step.control,
+          context,
+          options,
+        );
+        for await (const binding of <AsyncIterable<RDF.Bindings>> <any> stream) {
+          emitOnce(binding);
+        }
+        for (const binding of await this.queryOriginalStarWithInput(starPatterns, inputBindings, context, options)) {
+          emitOnce(binding);
+        }
+        return;
+      }
+      for (const binding of await this.queryStarViaControlledSource(
+        starPatterns,
+        inputBindings,
+        step.control,
+        context,
+        options,
+      )) {
+        emitOnce(binding);
+      }
+      return;
     }
 
     throw new Error(`WiseKG encountered unsupported plan control '${step.control}'.`);
@@ -511,14 +655,15 @@ export class QuerySourceWiseKg implements IQuerySource {
     return this.dataFactory.literal(trimmed);
   }
 
-  // Detect controls that refer to a downloadable HDT partition.
-  private isPartitionControl(control: string): boolean {
-    return this.extractPartitionId(control) !== undefined || control.endsWith('.hdt');
+  // Molecule controls ship HDT partitions for local client-side evaluation.
+  private isPartitionShippingControl(control: string): boolean {
+    return control.includes('/molecule/') || control.startsWith('molecule/') || control.endsWith('.hdt');
   }
 
-  // Detect controls that should be evaluated through the original source.
-  private isOriginalSourceControl(control: string): boolean {
-    return control === 'wisekg' || control === 'smartkg+' || normalizeUrl(control) === this.originalSourceUrl;
+  // Dataset and /partition controls are evaluated by their server-side fragment interface.
+  private isServerSourceControl(control: string): boolean {
+    return control === 'wisekg' || control === 'smartkg+' || control.includes('/partition/') ||
+      control.startsWith('partition/') || normalizeUrl(control) === this.originalSourceUrl;
   }
 
   // Download or reuse the local HDT file for a partition control.
@@ -536,6 +681,16 @@ export class QuerySourceWiseKg implements IQuerySource {
     const body = ActorHttp.toNodeReadable(response.body);
     const payload = await readStreamToBuffer(body);
     this.writePartitionPayload(partitionPath, payload);
+    if (!existsSync(`${partitionPath}.index.v1-1`)) {
+      const indexResponse = await this.mediatorHttp.mediate({
+        context: this.defaultContext,
+        input: `${partitionUrl}.index.v1-1`,
+      });
+      if (indexResponse.ok) {
+        const indexBody = ActorHttp.toNodeReadable(indexResponse.body);
+        writeFileSync(`${partitionPath}.index.v1-1`, await readStreamToBuffer(indexBody));
+      }
+    }
     return partitionPath;
   }
 
@@ -671,13 +826,17 @@ export class QuerySourceWiseKg implements IQuerySource {
     patterns: Algebra.Pattern[],
     context: IActionContext,
     options?: IQueryBindingsOptions,
+    inputBindings?: RDF.Bindings[],
   ): Promise<RDF.Bindings[]> {
-    const unboundOrder = await this.getUnboundOriginalSourceJoinOrder(patterns, context);
+    const initialBindings = inputBindings ?? [ await this.emptyBinding() ];
+    const unboundOrder = initialBindings.length === 1 && initialBindings[0].size === 0 ?
+      await this.getUnboundOriginalSourceJoinOrder(patterns, context) :
+      undefined;
     if (unboundOrder) {
       return this.queryStarViaOriginalSourceUnbound(unboundOrder, context, options);
     }
 
-    let results: RDF.Bindings[] = [ await this.emptyBinding() ];
+    let results = initialBindings;
     const remaining = [ ...patterns ];
 
     while (remaining.length > 0) {
@@ -743,11 +902,12 @@ export class QuerySourceWiseKg implements IQuerySource {
     patterns: Algebra.Pattern[],
     context: IActionContext,
     options?: IQueryBindingsOptions,
+    inputBindings?: RDF.Bindings[],
   ): Promise<RDF.Bindings[]> {
     const maxAttempts = 8;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        return await this.queryStarViaOriginalSource(patterns, context, options);
+        return await this.queryStarViaOriginalSource(patterns, context, options, inputBindings);
       } catch (error) {
         if (attempt === maxAttempts) {
           throw error;
@@ -849,6 +1009,7 @@ export class QuerySourceWiseKg implements IQuerySource {
     inputBindings: RDF.Bindings[],
     context: IActionContext,
     options?: IQueryBindingsOptions,
+    sourceUrl = this.originalSourceUrl,
   ): Promise<RDF.Bindings[]> {
     const grouped = new Map<string, { pattern: Algebra.Pattern; inputBindings: RDF.Bindings[] }>();
     for (const inputBinding of inputBindings) {
@@ -861,12 +1022,117 @@ export class QuerySourceWiseKg implements IQuerySource {
 
     const results: RDF.Bindings[] = [];
     for (const group of grouped.values()) {
-      const stream = await this.queryFallbackBindings(group.pattern, context, options);
+      const stream = await this.queryFallbackBindings(group.pattern, context, options, sourceUrl);
       const bindings = await this.collectBindingsFromStream(stream);
       results.push(...await this.joinBindingsLists(group.inputBindings, bindings));
     }
 
     return this.deduplicateBindings(results);
+  }
+
+  private async queryStarViaControlledSource(
+    patterns: Algebra.Pattern[],
+    inputBindings: RDF.Bindings[],
+    control: string,
+    context: IActionContext,
+    options?: IQueryBindingsOptions,
+  ): Promise<RDF.Bindings[]> {
+    const sourceUrl = this.resolveControlUrl(control);
+    if (this.isServerPartitionControl(control)) {
+      const stream = await this.queryPartitionStarBindings(patterns, inputBindings, control, context, options);
+      return this.collectBindingsFromStream(stream);
+    }
+
+    let results = inputBindings;
+    const remaining = [ ...patterns ];
+    while (remaining.length > 0) {
+      const nextIndex = await this.selectNextOriginalSourcePattern(remaining, results, context);
+      const [ pattern ] = remaining.splice(nextIndex, 1);
+      results = await this.queryOriginalSourcePatternWithBindings(pattern, results, context, options, sourceUrl);
+      if (results.length === 0) {
+        break;
+      }
+    }
+    return this.deduplicateBindings(results);
+  }
+
+  private async queryOriginalStarWithInput(
+    patterns: Algebra.Pattern[],
+    inputBindings: RDF.Bindings[],
+    context: IActionContext,
+    options?: IQueryBindingsOptions,
+  ): Promise<RDF.Bindings[]> {
+    const sourceResults = await this.queryStarViaOriginalSourceWithRetry(patterns, context, options);
+    return this.deduplicateBindings(await this.joinBindingsLists(inputBindings, sourceResults));
+  }
+
+  private isServerPartitionControl(control: string): boolean {
+    return control.includes('/partition/') || control.startsWith('partition/');
+  }
+
+  private async queryPartitionStarBindings(
+    patterns: Algebra.Pattern[],
+    inputBindings: RDF.Bindings[],
+    control: string,
+    context: IActionContext,
+    options?: IQueryBindingsOptions,
+  ): Promise<BindingsStream> {
+    const sourceUrl = this.resolveControlUrl(control);
+    const operation = new AlgebraFactory(<RDF.DataFactory> <unknown> this.dataFactory).createBgp(patterns);
+    const joinBindings = this.createJoinBindings(inputBindings);
+    return this.queryForcedSourceBindings(
+      operation,
+      context,
+      { ...options, joinBindings },
+      sourceUrl,
+      'spf',
+    );
+  }
+
+  private async queryForcedSourceBindings(
+    operation: Algebra.Operation,
+    context: IActionContext,
+    options: IQueryBindingsOptions,
+    sourceUrl: string,
+    forceSourceType: string,
+  ): Promise<BindingsStream> {
+    if (!this.mediatorQuerySourceDereferenceLink) {
+      throw new Error(`WiseKG can not dereference forced ${forceSourceType} source ${sourceUrl}.`);
+    }
+    const fallbackContext = setContextFlag(context, KEY_CONTEXT_WISEKG_FALLBACK, true);
+    const result = await this.mediatorQuerySourceDereferenceLink.mediate({
+      context: fallbackContext,
+      link: { url: sourceUrl, forceSourceType },
+      handledDatasets: {},
+    });
+    if (!result?.source || typeof result.source.queryBindings !== 'function') {
+      throw new Error(`WiseKG did not obtain a queryable ${forceSourceType} source for ${sourceUrl}.`);
+    }
+    return result.source.queryBindings(operation, fallbackContext, options);
+  }
+
+  private createJoinBindings(bindings: RDF.Bindings[]): NonNullable<IQueryBindingsOptions['joinBindings']> {
+    const variables = getBindingsVariables(bindings);
+    return {
+      bindings: <BindingsStream> <unknown> new ArrayBindingsIterator(Promise.resolve(bindings), variables),
+      metadata: {
+        state: createMetadataValidationState(),
+        cardinality: { type: 'exact', value: bindings.length },
+        variables,
+        next: [],
+      },
+    };
+  }
+
+  private resolveControlUrl(control: string): string {
+    if (control === 'wisekg' || control === 'smartkg+' || normalizeUrl(control) === this.originalSourceUrl) {
+      return this.originalSourceUrl;
+    }
+    if (/^https?:\/\//u.test(control)) {
+      return control;
+    }
+    const origin = new URL(this.originalSourceUrl).origin;
+    return new URL(control.replace(/^\//u, ''), `${origin}/`).toString().replace(/\/$/u, '');
   }
 
   // Substitute variables in a pattern with values from one binding.
@@ -915,10 +1181,14 @@ export class QuerySourceWiseKg implements IQuerySource {
     operation: Algebra.Operation,
     context: IActionContext,
     options?: IQueryBindingsOptions,
+    sourceUrl = this.originalSourceUrl,
   ): Promise<BindingsStream> {
     const variables = getOperationVariables(operation);
     return <BindingsStream> <unknown>
-      new ArrayBindingsIterator(this.collectFallbackBindings(operation, context, options), variables);
+      new ArrayBindingsIterator(
+        this.collectFallbackBindings(operation, context, options, sourceUrl),
+        variables,
+      );
   }
 
   // Traverse fallback links and collect bindings from compatible sources.
@@ -926,6 +1196,7 @@ export class QuerySourceWiseKg implements IQuerySource {
     operation: Algebra.Operation,
     context: IActionContext,
     options?: IQueryBindingsOptions,
+    sourceUrl = this.originalSourceUrl,
   ): Promise<RDF.Bindings[]> {
     if (!this.mediatorQuerySourceDereferenceLink) {
       return [];
@@ -933,7 +1204,7 @@ export class QuerySourceWiseKg implements IQuerySource {
 
     const fallbackContext = setContextFlag(context, KEY_CONTEXT_WISEKG_FALLBACK, true);
     const handledDatasets: Record<string, boolean> = {};
-    const queuedLinks: string[] = [ this.originalSourceUrl ];
+    const queuedLinks: string[] = [ sourceUrl ];
     const seenLinks = new Set<string>();
     const results: RDF.Bindings[] = [];
 
@@ -963,7 +1234,7 @@ export class QuerySourceWiseKg implements IQuerySource {
         streamNextLinks :
         getMetadataNextLinks(result?.metadata);
       for (const link of nextLinks) {
-        if (!seenLinks.has(link) && !isDatasetPageLink(link, this.originalSourceUrl)) {
+        if (!seenLinks.has(link) && !isDatasetPageLink(link, sourceUrl)) {
           queuedLinks.push(link);
         }
       }
@@ -1030,6 +1301,26 @@ export class QuerySourceWiseKg implements IQuerySource {
   private async joinBindingsLists(left: RDF.Bindings[], right: RDF.Bindings[]): Promise<RDF.Bindings[]> {
     const bindingsFactory = await this.getBindingsFactory();
     return joinBindingRecords(left.map(bindingToRecord), right.map(bindingToRecord), bindingsFactory);
+  }
+
+  private async emitJoinedBindings(
+    left: RDF.Bindings[],
+    right: RDF.Bindings[],
+    emit: (binding: RDF.Bindings) => void,
+  ): Promise<void> {
+    const bindingsFactory = await this.getBindingsFactory();
+    const seen = new Set<string>();
+    for (const binding of joinBindingRecordsIterator(
+      left.map(bindingToRecord),
+      right.map(bindingToRecord),
+      bindingsFactory,
+    )) {
+      const key = bindingKey(binding);
+      if (!seen.has(key)) {
+        seen.add(key);
+        emit(binding);
+      }
+    }
   }
 
   // Remove duplicate bindings by stable variable-term assignments.
@@ -1155,20 +1446,28 @@ function joinBindingRecords(
   rightRecords: Record<string, RDF.Term>[],
   bindingsFactory: BindingsFactory,
 ): RDF.Bindings[] {
+  return [ ...joinBindingRecordsIterator(leftRecords, rightRecords, bindingsFactory) ];
+}
+
+function* joinBindingRecordsIterator(
+  leftRecords: Record<string, RDF.Term>[],
+  rightRecords: Record<string, RDF.Term>[],
+  bindingsFactory: BindingsFactory,
+): IterableIterator<RDF.Bindings> {
   if (leftRecords.length === 0 || rightRecords.length === 0) {
-    return [];
+    return;
   }
 
   const sharedVariables = getSharedBoundVariables(leftRecords, rightRecords);
   if (sharedVariables.length === 0) {
-    return nestedJoinBindingRecords(leftRecords, rightRecords, bindingsFactory);
+    yield* nestedJoinBindingRecordsIterator(leftRecords, rightRecords, bindingsFactory);
+    return;
   }
 
   const indexedIsLeft = leftRecords.length <= rightRecords.length;
   const indexed = indexedIsLeft ? leftRecords : rightRecords;
   const probes = indexedIsLeft ? rightRecords : leftRecords;
   const index = new Map<string, Record<string, RDF.Term>[]>();
-  const results: RDF.Bindings[] = [];
 
   for (const record of indexed) {
     const key = joinKey(record, sharedVariables);
@@ -1189,29 +1488,42 @@ function joinBindingRecords(
       const leftMap = indexedIsLeft ? candidate : probe;
       const rightMap = indexedIsLeft ? probe : candidate;
       if (areBindingRecordsCompatible(leftMap, rightMap)) {
-        results.push(bindingsFactory.fromRecord({ ...leftMap, ...rightMap }));
+        yield bindingsFactory.fromRecord({ ...leftMap, ...rightMap });
       }
     }
   }
-
-  return results;
 }
 
 // Join binding records with a nested-loop fallback.
-function nestedJoinBindingRecords(
+function* nestedJoinBindingRecordsIterator(
   leftRecords: Record<string, RDF.Term>[],
   rightRecords: Record<string, RDF.Term>[],
   bindingsFactory: BindingsFactory,
-): RDF.Bindings[] {
-  const results: RDF.Bindings[] = [];
+): IterableIterator<RDF.Bindings> {
   for (const leftMap of leftRecords) {
     for (const rightMap of rightRecords) {
       if (areBindingRecordsCompatible(leftMap, rightMap)) {
-        results.push(bindingsFactory.fromRecord({ ...leftMap, ...rightMap }));
+        yield bindingsFactory.fromRecord({ ...leftMap, ...rightMap });
       }
     }
   }
-  return results;
+}
+
+function bindingKey(binding: RDF.Bindings): string {
+  return [ ...binding ]
+    .map(([ variable, value ]) => `${variable.value}=${termToString(value)}`)
+    .sort()
+    .join('|');
+}
+
+function getBindingsVariables(bindings: RDF.Bindings[]): MetadataBindings['variables'] {
+  const variables = new Map<string, RDF.Variable>();
+  for (const binding of bindings) {
+    for (const [ variable ] of binding) {
+      variables.set(variable.value, variable);
+    }
+  }
+  return [ ...variables.values() ].map(variable => ({ variable, canBeUndef: false }));
 }
 
 // Find variables that are bound on both sides of a join.

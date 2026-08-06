@@ -119,8 +119,11 @@ class ArrayBindingsIterator extends BufferedIterator<RDF.Bindings> {
         variables,
         next: [],
       } satisfies MetadataBindings);
-      for (const binding of bindings) {
+      for (const [ index, binding ] of bindings.entries()) {
         this._push(binding);
+        if ((index + 1) % 128 === 0) {
+          await new Promise<void>(resolve => setImmediate(resolve));
+        }
       }
       this.close();
     } catch (error) {
@@ -647,7 +650,7 @@ export class QuerySourceSmartKg implements IQuerySource {
       }
       const partitionPath = await this.fetchPartitionFile(family);
       const partitionResults = await this.evaluatePatternsOnPartition(partitionPath, patterns);
-      allResults.push(...partitionResults);
+      appendItems(allResults, partitionResults);
     }
 
     return deduplicateBindings(allResults);
@@ -695,7 +698,7 @@ export class QuerySourceSmartKg implements IQuerySource {
           break;
         }
       }
-      allResults.push(...results);
+      appendItems(allResults, results);
     }
 
     return deduplicateBindings(allResults);
@@ -747,7 +750,7 @@ export class QuerySourceSmartKg implements IQuerySource {
       }
       const partitionPath = await this.fetchPartitionFile(family);
       const partitionResults = await this.evaluatePatternsOnPartition(partitionPath, [ pattern ]);
-      allResults.push(...partitionResults);
+      appendItems(allResults, partitionResults);
     }
 
     return deduplicateBindings(allResults);
@@ -801,7 +804,7 @@ export class QuerySourceSmartKg implements IQuerySource {
         { offset, limit: pageSize },
       );
       const bindings: RDF.Bindings[] = Array.isArray(result?.bindings) ? result.bindings : [];
-      results.push(...bindings);
+      appendItems(results, bindings);
 
       if (bindings.length < pageSize) {
         break;
@@ -856,7 +859,7 @@ export class QuerySourceSmartKg implements IQuerySource {
 
       const stream = source.queryBindings(operation, fallbackContext, options);
       const { bindings, metadata } = await this.collectBindingsAndMetadata(stream);
-      results.push(...bindings);
+      appendItems(results, bindings);
 
       const streamNextLinks = getMetadataNextLinks(metadata);
       const nextLinks = streamNextLinks.length > 0 ? streamNextLinks : getMetadataNextLinks(sourceResult.metadata);
@@ -1344,6 +1347,12 @@ function getSharedBoundVariables(
 
 function joinKey(record: Record<string, RDF.Term>, variables: string[]): string {
   return variables.map(variable => termToString(record[variable])).join('\u001F');
+}
+
+function appendItems<T>(target: T[], items: Iterable<T>): void {
+  for (const item of items) {
+    target.push(item);
+  }
 }
 
 function deduplicateBindings(bindings: RDF.Bindings[]): RDF.Bindings[] {

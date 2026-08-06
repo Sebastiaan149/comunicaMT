@@ -1,5 +1,5 @@
 /* eslint-disable import/no-nodejs-modules */
-import { closeSync, existsSync, mkdirSync, openSync, readSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import type { IActionHttp, IActorHttpOutput } from '@comunica/bus-http';
@@ -54,6 +54,7 @@ type HdtDocument = {
 type HttpMediator =
 Mediator<Actor<IActionHttp, IActorTest, IActorHttpOutput>, IActionHttp, IActorTest, IActorHttpOutput>;
 let hdtModulePromise: Promise<{ fromFile: (path: string) => Promise<HdtDocument> }> | undefined;
+const partitionDownloadPromises = new Map<string, Promise<string>>();
 
 // Lazily load HDT support so startup does not eagerly open native modules.
 async function loadHdtModule(): Promise<{ fromFile: (path: string) => Promise<HdtDocument> }> {
@@ -87,6 +88,7 @@ function createMetadataValidationState(): MetadataBindings['state'] {
 // Keeps HDT documents open per cache path during a query-source lifetime.
 class HdtDocumentCache {
   private readonly cache = new Map<string, Promise<HdtDocument>>();
+  private opening: Promise<void> = Promise.resolve();
 
   // Load or reuse the HDT document for a partition file.
   public async getDocument(path: string): Promise<HdtDocument> {
@@ -94,7 +96,8 @@ class HdtDocumentCache {
     if (existing) {
       return existing;
     }
-    const documentPromise = loadHdtModule().then(hdt => hdt.fromFile(path));
+    const documentPromise = this.opening.then(async() => (await loadHdtModule()).fromFile(path));
+    this.opening = documentPromise.then(() => {}, () => {});
     this.cache.set(path, documentPromise);
     return documentPromise;
   }
@@ -670,10 +673,28 @@ export class QuerySourceWiseKg implements IQuerySource {
   private async fetchPartitionFileByControl(control: string): Promise<string> {
     const partitionUrl = this.getPartitionHdtUrlForControl(control);
     const partitionPath = join(this.cacheFolder, encodeURIComponent(partitionUrl));
+    removeEmptyFile(`${partitionPath}.index.v1-1`);
     if (isHdtFile(partitionPath)) {
       return partitionPath;
     }
 
+    const existingDownload = partitionDownloadPromises.get(partitionPath);
+    if (existingDownload) {
+      return existingDownload;
+    }
+
+    const download = this.downloadPartitionFile(partitionUrl, partitionPath);
+    partitionDownloadPromises.set(partitionPath, download);
+    try {
+      return await download;
+    } finally {
+      if (partitionDownloadPromises.get(partitionPath) === download) {
+        partitionDownloadPromises.delete(partitionPath);
+      }
+    }
+  }
+
+  private async downloadPartitionFile(partitionUrl: string, partitionPath: string): Promise<string> {
     const response = await this.mediatorHttp.mediate({ context: this.defaultContext, input: partitionUrl });
     if (!response.ok) {
       throw new Error(`WiseKG partition download failed with HTTP ${response.status}: ${partitionUrl}`);
@@ -688,7 +709,10 @@ export class QuerySourceWiseKg implements IQuerySource {
       });
       if (indexResponse.ok) {
         const indexBody = ActorHttp.toNodeReadable(indexResponse.body);
-        writeFileSync(`${partitionPath}.index.v1-1`, await readStreamToBuffer(indexBody));
+        const indexPayload = await readStreamToBuffer(indexBody);
+        if (indexPayload.length > 0) {
+          writeFileSync(`${partitionPath}.index.v1-1`, indexPayload);
+        }
       }
     }
     return partitionPath;
@@ -710,7 +734,7 @@ export class QuerySourceWiseKg implements IQuerySource {
 
     writeFileSync(partitionPath, hdtEntry.payload);
     const indexEntry = entries.find(entry => entry.name === `${hdtEntry.name}.index.v1-1`);
-    if (indexEntry) {
+    if (indexEntry && indexEntry.payload.length > 0) {
       writeFileSync(`${partitionPath}.index.v1-1`, indexEntry.payload);
     }
   }
@@ -1625,6 +1649,12 @@ function isHdtFile(path: string): boolean {
     return readSync(fd, header, 0, 4, 0) === 4 && isHdtBuffer(header);
   } finally {
     closeSync(fd);
+  }
+}
+
+function removeEmptyFile(path: string): void {
+  if (existsSync(path) && statSync(path).size === 0) {
+    unlinkSync(path);
   }
 }
 

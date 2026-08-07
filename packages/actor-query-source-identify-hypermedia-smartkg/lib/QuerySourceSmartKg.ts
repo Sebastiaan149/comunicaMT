@@ -1335,14 +1335,24 @@ function getSharedBoundVariables(
   leftRecords: Record<string, RDF.Term>[],
   rightRecords: Record<string, RDF.Term>[],
 ): string[] {
-  const leftVariables = new Set(leftRecords.flatMap(record => Object.keys(record)));
-  const rightVariables = new Set(rightRecords.flatMap(record => Object.keys(record)));
+  const leftVariables = collectRecordVariables(leftRecords);
+  const rightVariables = collectRecordVariables(rightRecords);
   const shared = [ ...leftVariables ].filter(variable => rightVariables.has(variable));
   return shared.every(variable =>
     leftRecords.every(record => Boolean(record[variable])) &&
     rightRecords.every(record => Boolean(record[variable]))) ?
     shared :
       [];
+}
+
+function collectRecordVariables(records: Record<string, RDF.Term>[]): Set<string> {
+  const variables = new Set<string>();
+  for (const record of records) {
+    for (const variable of Object.keys(record)) {
+      variables.add(variable);
+    }
+  }
+  return variables;
 }
 
 function joinKey(record: Record<string, RDF.Term>, variables: string[]): string {

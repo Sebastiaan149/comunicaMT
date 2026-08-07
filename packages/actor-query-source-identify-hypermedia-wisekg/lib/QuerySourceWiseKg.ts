@@ -1067,6 +1067,15 @@ export class QuerySourceWiseKg implements IQuerySource {
       return this.collectBindingsFromStream(stream);
     }
 
+    if (sourceUrl === this.originalSourceUrl && await this.shouldQueryControlledSourceUnbound(
+      patterns,
+      inputBindings,
+      context,
+    )) {
+      const sourceResults = await this.queryStarViaOriginalSourceWithRetry(patterns, context, options);
+      return this.deduplicateBindings(await this.joinBindingsLists(inputBindings, sourceResults));
+    }
+
     let results = inputBindings;
     const remaining = [ ...patterns ];
     while (remaining.length > 0) {
@@ -1078,6 +1087,27 @@ export class QuerySourceWiseKg implements IQuerySource {
       }
     }
     return this.deduplicateBindings(results);
+  }
+
+  // Avoid issuing many equivalent bound requests when the complete fragment is cheaper to fetch once.
+  private async shouldQueryControlledSourceUnbound(
+    patterns: Algebra.Pattern[],
+    inputBindings: RDF.Bindings[],
+    context: IActionContext,
+  ): Promise<boolean> {
+    if (inputBindings.length < 50) {
+      return false;
+    }
+
+    const cardinalities = await Promise.all(
+      patterns.map(pattern => this.estimateOriginalSourcePatternCardinality(pattern, context)),
+    );
+    if (cardinalities.some(cardinality => !Number.isFinite(cardinality) || cardinality === Number.MAX_SAFE_INTEGER)) {
+      return false;
+    }
+
+    const totalCardinality = cardinalities.reduce((sum, cardinality) => sum + cardinality, 0);
+    return totalCardinality <= inputBindings.length * 100;
   }
 
   private async queryOriginalStarWithInput(

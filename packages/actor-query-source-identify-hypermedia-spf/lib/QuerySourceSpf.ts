@@ -576,7 +576,6 @@ class BasicGraphPatternIterator implements IBindingChunkIterator {
   private async chooseNextStar(stars: ISpfStar[], currentBindings: BindingChunk): Promise<ISpfStarChoice> {
     let best: ISpfStarChoice | undefined;
     let firstAbsentCount: ISpfStarChoice | undefined;
-    const bound = hasBindings(currentBindings);
 
     for (const star of stars) {
       const firstPage = await this.source.fetchFirstSpfPage(star, currentBindings, this.context);
@@ -591,7 +590,7 @@ class BasicGraphPatternIterator implements IBindingChunkIterator {
       if (!Number.isFinite(count) || count < 0) {
         throw new Error(`Malformed SPF metadata: invalid void:triples cardinality '${count}'.`);
       }
-      if (!best || (bound ? count < best.count! : count > best.count!)) {
+      if (!best || count < best.count!) {
         best = { star, firstPage, count };
       }
     }
@@ -886,11 +885,6 @@ function getBoundStarFields(
     addField(pattern.object, `o${position}`);
   }
   return fields;
-}
-
-// Check whether a binding chunk contains at least one bound variable.
-function hasBindings(bindings: BindingChunk): boolean {
-  return bindings.some(binding => [ ...binding ].length > 0);
 }
 
 // Collect all pattern operations from a supported algebra tree.

@@ -40,7 +40,6 @@ import {
   selectOptimalFamilies,
 } from './Utils';
 
-const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
 type HdtDocument = {
   searchBindings: (
     bindingsFactory: BindingsFactory,
@@ -404,6 +403,13 @@ export class QuerySourceSmartKg implements IQuerySource {
   ): Promise<RDF.Bindings[]> {
     const usePartitions = await this.shouldUsePartitions(pattern, context);
     if (usePartitions) {
+      if (this.smartKgPlusSource) {
+        const [ partitionResults, sourceResults ] = await Promise.all([
+          this.queryPatternsViaPartitions([ pattern ], context, options),
+          this.queryFallbackBindings(pattern, context, options).then(stream => this.collectBindingsFromStream(stream)),
+        ]);
+        return deduplicateBindings([ ...partitionResults, ...sourceResults ]);
+      }
       const partitionResults = await this.queryPatternsViaPartitions([ pattern ], context, options);
       if (partitionResults.length > 0) {
         return partitionResults;
@@ -418,8 +424,14 @@ export class QuerySourceSmartKg implements IQuerySource {
     options?: IQueryBindingsOptions,
   ): Promise<RDF.Bindings[]> {
     const metadata = await this.fetchMetadata();
-    const canUseTypedPartitions = !this.smartKgPlusSource || !hasUnboundTypeClass(patterns);
-    if (canUseTypedPartitions && patterns.length >= 2 && isStarEligibleForPartitions(patterns, metadata)) {
+    if (patterns.length >= 2 && isStarEligibleForPartitions(patterns, metadata)) {
+      if (this.smartKgPlusSource) {
+        const [ partitionResults, sourceResults ] = await Promise.all([
+          this.queryPatternsViaPartitions(patterns, context, options),
+          this.queryPatternsViaOriginalSource(patterns, context, options),
+        ]);
+        return deduplicateBindings([ ...partitionResults, ...sourceResults ]);
+      }
       return this.queryPatternsViaPartitions(patterns, context, options);
     }
 
@@ -510,9 +522,6 @@ export class QuerySourceSmartKg implements IQuerySource {
 
   private async shouldUsePartitions(pattern: Algebra.Pattern, context: IActionContext): Promise<boolean> {
     if (pattern.predicate.termType === 'Variable') {
-      return false;
-    }
-    if (this.smartKgPlusSource && hasUnboundTypeClass([ pattern ])) {
       return false;
     }
 
@@ -1450,13 +1459,12 @@ function selectCompatibleStarFamilies(patterns: Algebra.Pattern[], metadata: ISm
   if (queryPredicates.size === 0) {
     return [];
   }
-  const boundTypeClasses = getBoundTypeClasses(patterns);
 
   const materializedFamilies = metadata.families.filter((family) => {
     if (!family.predicateSet || family.predicateSet.length === 0) {
       return false;
     }
-    return isResolvableFamily(family) && familyMatchesBoundTypeClasses(family, boundTypeClasses);
+    return isResolvableFamily(family);
   });
 
   const matchingSupersets = materializedFamilies.filter((family) => {
@@ -1493,11 +1501,10 @@ function getPatternEstimatedPartitionSize(pattern: Algebra.Pattern, metadata: IS
   }
 
   const predicate = termToString(pattern.predicate);
-  const boundTypeClasses = getBoundTypeClasses([ pattern ]);
   let totalTriples = 0;
   let matchingFamilies = 0;
   for (const family of metadata.families) {
-    if (family.predicateSet?.includes(predicate) && familyMatchesBoundTypeClasses(family, boundTypeClasses)) {
+    if (family.predicateSet?.includes(predicate)) {
       matchingFamilies++;
       totalTriples += family.numTriples;
     }
@@ -1511,7 +1518,6 @@ function selectStarScopedMaterializedFamilies(
   metadata: ISmartKgMetadata,
 ): { completeFamilies: ISmartKgFamily[]; partialFamilies: ISmartKgFamily[] } {
   const starPredicates = extractPredicates(patterns);
-  const boundTypeClasses = getBoundTypeClasses(patterns);
   const scoped = new Map<number, ISmartKgFamily>();
 
   for (const family of candidateFamilies) {
@@ -1520,9 +1526,6 @@ function selectStarScopedMaterializedFamilies(
       resolvedFamilies.filter(resolvedFamily => predicatesAreContainedInFamily(starPredicates, resolvedFamily)) :
       resolvedFamilies;
     for (const scopedFamily of scopedFamilies) {
-      if (!familyMatchesBoundTypeClasses(scopedFamily, boundTypeClasses)) {
-        continue;
-      }
       scoped.set(scopedFamily.index, scopedFamily);
     }
   }
@@ -1536,33 +1539,6 @@ function selectStarScopedMaterializedFamilies(
 
 function isPatternPredicateContainedInSet(pattern: Algebra.Pattern, predicates: Set<string>): boolean {
   return pattern.predicate.termType !== 'Variable' && predicates.has(termToString(pattern.predicate));
-}
-
-function hasUnboundTypeClass(patterns: Algebra.Pattern[]): boolean {
-  return patterns.some(pattern =>
-    pattern.predicate.termType !== 'Variable' &&
-    termToString(pattern.predicate) === RDF_TYPE &&
-    pattern.object.termType === 'Variable');
-}
-
-function getBoundTypeClasses(patterns: Algebra.Pattern[]): Set<string> {
-  const classes = new Set<string>();
-  for (const pattern of patterns) {
-    if (pattern.predicate.termType !== 'Variable' &&
-      termToString(pattern.predicate) === RDF_TYPE &&
-      pattern.object.termType !== 'Variable') {
-      classes.add(termToString(pattern.object));
-    }
-  }
-  return classes;
-}
-
-function familyMatchesBoundTypeClasses(family: ISmartKgFamily, boundTypeClasses: Set<string>): boolean {
-  if (boundTypeClasses.size === 0 || !Array.isArray(family.classesSet) || family.classesSet.length === 0) {
-    return true;
-  }
-  const familyClasses = new Set(family.classesSet);
-  return [ ...boundTypeClasses ].every(typeClass => familyClasses.has(typeClass));
 }
 
 function patternToKey(pattern: Algebra.Pattern): string {

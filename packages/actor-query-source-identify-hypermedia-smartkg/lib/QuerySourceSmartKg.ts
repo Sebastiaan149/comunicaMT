@@ -375,23 +375,6 @@ export class QuerySourceSmartKg implements IQuerySource {
     await this.hdtCache.dispose();
   }
 
-  private async evaluateOperation(
-    operation: Algebra.Operation,
-    context: IActionContext,
-    options?: IQueryBindingsOptions,
-  ): Promise<RDF.Bindings[]> {
-    if (isKnownOperation(operation, Algebra.Types.PATTERN)) {
-      return this.evaluatePattern(operation, context, options);
-    }
-    if (isKnownOperation(operation, Algebra.Types.BGP)) {
-      return this.evaluateBgp(operation, context, options);
-    }
-    if (isKnownOperation(operation, Algebra.Types.JOIN)) {
-      return this.evaluateStarJoin(operation, context, options);
-    }
-    throw new Error(`Unsupported operation type '${operation.type}' for QuerySourceSmartKg.`);
-  }
-
   private async streamOperation(
     operation: Algebra.Operation,
     context: IActionContext,
@@ -411,7 +394,10 @@ export class QuerySourceSmartKg implements IQuerySource {
       return;
     }
 
-    for (const binding of await this.evaluateOperation(operation, context, options)) {
+    if (!isKnownOperation(operation, Algebra.Types.PATTERN)) {
+      throw new Error(`Unsupported operation type '${operation.type}' for QuerySourceSmartKg.`);
+    }
+    for (const binding of await this.evaluatePattern(operation, context, options)) {
       await emit(binding);
     }
   }
@@ -441,44 +427,6 @@ export class QuerySourceSmartKg implements IQuerySource {
         return;
       }
     }
-  }
-
-  private async evaluateBgp(
-    bgp: Algebra.Bgp,
-    context: IActionContext,
-    options?: IQueryBindingsOptions,
-  ): Promise<RDF.Bindings[]> {
-    return this.evaluatePatternsByStars(bgp.patterns, context, options);
-  }
-
-  private async evaluateStarJoin(
-    operation: Algebra.Operation,
-    context: IActionContext,
-    options?: IQueryBindingsOptions,
-  ): Promise<RDF.Bindings[]> {
-    const patterns = collectPatterns(operation);
-    if (patterns.length === 0) {
-      throw new Error(`Unsupported non-pattern operation '${operation.type}' in QuerySourceSmartKg join.`);
-    }
-    return this.evaluatePatternsByStars(patterns, context, options);
-  }
-
-  private async evaluatePatternsByStars(
-    patterns: Algebra.Pattern[],
-    context: IActionContext,
-    options?: IQueryBindingsOptions,
-  ): Promise<RDF.Bindings[]> {
-    const stars = await this.orderStarsForExecution(groupPatternsBySubject(patterns), context);
-
-    let results: RDF.Bindings[] = [ await this.emptyBinding() ];
-    for (const starPatterns of stars) {
-      const starResults = await this.evaluateStar(starPatterns, context, options);
-      results = await this.joinBindingsLists(results, starResults);
-      if (results.length === 0) {
-        break;
-      }
-    }
-    return deduplicateBindings(results);
   }
 
   private async orderStarsForExecution(
@@ -577,9 +525,10 @@ export class QuerySourceSmartKg implements IQuerySource {
   ): Promise<RDF.Bindings[]> {
     const usePartitions = await this.shouldUsePartitions(pattern, context);
     if (usePartitions) {
-      // An empty partition result is authoritative. Retrying it through TPF
-      // turns a selective partition stage into an unbounded client-side scan.
-      return this.queryPatternsViaPartitions([ pattern ], context, options);
+      const partitionResults = await this.queryPatternsViaPartitions([ pattern ], context, options);
+      if (partitionResults.length > 0) {
+        return partitionResults;
+      }
     }
     return this.collectBindingsFromStream(await this.queryFallbackBindings(pattern, context, options));
   }
@@ -591,9 +540,10 @@ export class QuerySourceSmartKg implements IQuerySource {
   ): Promise<RDF.Bindings[]> {
     const metadata = await this.fetchMetadata();
     if (patterns.length >= 2 && isStarEligibleForPartitions(patterns, metadata)) {
-      // Eligibility and coverage were established from the metadata above;
-      // zero matches must therefore remain zero instead of triggering TPF.
-      return this.queryPatternsViaPartitions(patterns, context, options);
+      const partitionResults = await this.queryPatternsViaPartitions(patterns, context, options);
+      if (partitionResults.length > 0) {
+        return partitionResults;
+      }
     }
 
     return this.queryPatternsViaOriginalSource(patterns, context, options);
@@ -780,16 +730,17 @@ export class QuerySourceSmartKg implements IQuerySource {
     families: ISmartKgFamily[],
   ): Promise<RDF.Bindings[]> {
     const allResults: RDF.Bindings[] = [];
+    const seen = new Set<string>();
     for (const family of families) {
       if (family.numTriples === 0 || !family.name) {
         continue;
       }
       const partitionPath = await this.fetchPartitionFile(family);
       const partitionResults = await this.evaluatePatternsOnPartition(partitionPath, patterns);
-      appendItems(allResults, partitionResults);
+      appendUniqueBindings(allResults, seen, partitionResults);
     }
 
-    return deduplicateBindings(allResults);
+    return allResults;
   }
 
   private async queryPatternsViaPartialFamilies(
@@ -802,6 +753,7 @@ export class QuerySourceSmartKg implements IQuerySource {
     const starPredicates = extractPredicates(patterns);
     const partialFamilies = candidateFamilies.filter(family => !predicatesAreContainedInFamily(starPredicates, family));
     const allResults: RDF.Bindings[] = [];
+    const seen = new Set<string>();
     const fallbackCache = new Map<string, RDF.Bindings[]>();
 
     for (const family of partialFamilies) {
@@ -834,10 +786,10 @@ export class QuerySourceSmartKg implements IQuerySource {
           break;
         }
       }
-      appendItems(allResults, results);
+      appendUniqueBindings(allResults, seen, results);
     }
 
-    return deduplicateBindings(allResults);
+    return allResults;
   }
 
   private async getFallbackPatternBindings(
@@ -880,16 +832,17 @@ export class QuerySourceSmartKg implements IQuerySource {
     }
 
     const allResults: RDF.Bindings[] = [];
+    const seen = new Set<string>();
     for (const family of optimalFamilies) {
       if (family.numTriples === 0 || !family.name) {
         continue;
       }
       const partitionPath = await this.fetchPartitionFile(family);
       const partitionResults = await this.evaluatePatternsOnPartition(partitionPath, [ pattern ]);
-      appendItems(allResults, partitionResults);
+      appendUniqueBindings(allResults, seen, partitionResults);
     }
 
-    return deduplicateBindings(allResults);
+    return allResults;
   }
 
   private async evaluatePatternsOnPartition(
@@ -1334,19 +1287,6 @@ export class QuerySourceSmartKg implements IQuerySource {
     return bindingsFactory.bindings();
   }
 
-  private emptyBindingsStream(variables: MetadataBindings['variables']): BindingsStream {
-    const iterator = <any> new EmptyIterator<RDF.Bindings>();
-    if (typeof iterator.setProperty === 'function') {
-      iterator.setProperty('metadata', {
-        state: createMetadataValidationState(),
-        cardinality: { type: 'exact', value: 0 },
-        variables,
-        next: [],
-      } satisfies MetadataBindings);
-    }
-    return <BindingsStream> iterator;
-  }
-
   private async collectBindingsFromStream(stream: BindingsStream): Promise<RDF.Bindings[]> {
     const bindings: RDF.Bindings[] = [];
     for await (const binding of <AsyncIterable<RDF.Bindings>><any> stream) {
@@ -1641,6 +1581,16 @@ function joinKey(record: Record<string, RDF.Term>, variables: string[]): string 
 function appendItems<T>(target: T[], items: Iterable<T>): void {
   for (const item of items) {
     target.push(item);
+  }
+}
+
+function appendUniqueBindings(target: RDF.Bindings[], seen: Set<string>, bindings: Iterable<RDF.Bindings>): void {
+  for (const binding of bindings) {
+    const key = bindingKey(binding);
+    if (!seen.has(key)) {
+      seen.add(key);
+      target.push(binding);
+    }
   }
 }
 
@@ -1950,15 +1900,27 @@ function filterMinimalByPredicateSet(families: ISmartKgFamily[]): ISmartKgFamily
 }
 
 function filterMaximalByPredicateSet(families: ISmartKgFamily[]): ISmartKgFamily[] {
-  return families.filter((family) => {
-    const familyPredicates = new Set(family.predicateSet);
-    return !families.some((other) => {
-      if (other.index === family.index) {
-        return false;
-      }
-      return isProperSubset(familyPredicates, new Set(other.predicateSet));
-    });
-  });
+  // Many materialized families share the same characteristic set. Comparing
+  // every family with every other family is quadratic in the partition count
+  // (over 21K entries for WatDiv 10M). Determine maximal characteristic sets
+  // once, then retain every family carrying one of those sets. This preserves
+  // precisely the same partitions and answers.
+  const signatureByFamily = new Map<ISmartKgFamily, string>();
+  const predicatesBySignature = new Map<string, Set<string>>();
+  for (const family of families) {
+    const signature = [ ...family.predicateSet ].sort().join('\u0000');
+    signatureByFamily.set(family, signature);
+    if (!predicatesBySignature.has(signature)) {
+      predicatesBySignature.set(signature, new Set(family.predicateSet));
+    }
+  }
+
+  const uniqueSets = [ ...predicatesBySignature.entries() ];
+  const maximalSignatures = new Set(uniqueSets
+    .filter(([ leftSignature, leftPredicates ]) => !uniqueSets.some(([ rightSignature, rightPredicates ]) =>
+      leftSignature !== rightSignature && isProperSubset(leftPredicates, rightPredicates)))
+    .map(([ signature ]) => signature));
+  return families.filter(family => maximalSignatures.has(signatureByFamily.get(family)!));
 }
 
 function deduplicateFamilies(families: ISmartKgFamily[]): ISmartKgFamily[] {

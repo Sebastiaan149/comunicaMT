@@ -20,7 +20,7 @@ export class ActorQueryOperationBgpSpf extends ActorQueryOperationTyped<Algebra.
     operation: Algebra.Bgp,
     _context: IActionContext,
   ): Promise<TestResult<IActorTest>> {
-    const source = getOperationSource(operation);
+    const source = getSpfSource(operation);
     if (!source || !isQuerySourceSpf(source.source)) {
       return failTest(`Actor ${this.name} only handles BGP operations with an SPF query source.`);
     }
@@ -32,7 +32,7 @@ export class ActorQueryOperationBgpSpf extends ActorQueryOperationTyped<Algebra.
     operation: Algebra.Bgp,
     context: IActionContext,
   ): Promise<IQueryOperationResult> {
-    const sourceWrapper: IQuerySourceWrapper = getOperationSource(operation)!;
+    const sourceWrapper: IQuerySourceWrapper = getSpfSource(operation)!;
     const mergedContext = sourceWrapper.context ? context.merge(sourceWrapper.context) : context;
     const bindingsStream = sourceWrapper.source.queryBindings(operation, mergedContext);
     return {
@@ -41,4 +41,21 @@ export class ActorQueryOperationBgpSpf extends ActorQueryOperationTyped<Algebra.
       metadata: getMetadataBindings(bindingsStream),
     };
   }
+}
+
+function getSpfSource(operation: Algebra.Bgp): IQuerySourceWrapper | undefined {
+  const bgpSource = getOperationSource(operation);
+  if (bgpSource) {
+    return isQuerySourceSpf(bgpSource.source) ? bgpSource : undefined;
+  }
+  if (operation.patterns.length === 0) {
+    return;
+  }
+  const source = getOperationSource(operation.patterns[0]);
+  if (!source || !isQuerySourceSpf(source.source)) {
+    return;
+  }
+  const hasCommonSource = operation.patterns
+    .every(pattern => getOperationSource(pattern)?.source === source.source);
+  return hasCommonSource ? source : undefined;
 }

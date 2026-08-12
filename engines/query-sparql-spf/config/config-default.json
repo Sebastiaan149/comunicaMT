@@ -4,6 +4,7 @@
   ],
   "import": [
     "ccqs:config/config-default-v5-1-3.json",
-    "query-source-identify-hypermedia/actors-spf.json"
+    "query-source-identify-hypermedia/actors-spf.json",
+    "query-operation/actors-spf-bgp.json"
   ]
 }

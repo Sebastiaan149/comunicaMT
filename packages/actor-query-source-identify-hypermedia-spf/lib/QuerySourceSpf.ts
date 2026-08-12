@@ -609,8 +609,14 @@ class BasicGraphPatternIterator implements IBindingChunkIterator {
   private async chooseNextStar(stars: ISpfStar[], currentBindings: BindingChunk): Promise<ISpfStarChoice> {
     let best: ISpfStarChoice | undefined;
     let firstAbsentCount: ISpfStarChoice | undefined;
+    const connectedStars = stars.filter(star => star.patterns
+      .some(pattern => patternSharesBoundVariable(pattern, currentBindings)));
+    // Once the pipeline has bindings, prefer a graph-connected stage. Picking
+    // a smaller disconnected fragment would form a Cartesian product before a
+    // later star reconnects both branches (catastrophic for WatDiv C2).
+    const eligibleStars = connectedStars.length > 0 ? connectedStars : stars;
 
-    for (const star of stars) {
+    for (const star of eligibleStars) {
       const anchors = star.anchored ?
           [ star ] :
         star.patterns.map(pattern => ({ subject: star.subject, patterns: [ pattern ]}));
@@ -648,6 +654,11 @@ class BasicGraphPatternIterator implements IBindingChunkIterator {
       rest: stars.slice(1),
     };
   }
+}
+
+function patternSharesBoundVariable(pattern: Algebra.Pattern, bindings: BindingChunk): boolean {
+  return [ pattern.subject, pattern.predicate, pattern.object, pattern.graph ]
+    .some(term => term.termType === 'Variable' && bindings.some(binding => binding.has(term)));
 }
 
 // Flattens binding chunks into one binding at a time for the stream wrapper.

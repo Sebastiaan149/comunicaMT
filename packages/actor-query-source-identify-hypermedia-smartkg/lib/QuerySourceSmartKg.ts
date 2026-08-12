@@ -180,19 +180,26 @@ class ArrayBindingsIterator extends BufferedIterator<RDF.Bindings> {
 class StreamingBindingsIterator extends BufferedIterator<RDF.Bindings> {
   private emitted = 0;
   private readonly state = createMetadataValidationState();
+  private availableSlots = 128;
+  private readonly slotWaiters: (() => void)[] = [];
 
   public constructor(
-    producer: (emit: (binding: RDF.Bindings) => void) => Promise<void>,
+    producer: (emit: (binding: RDF.Bindings) => Promise<void>) => Promise<void>,
     private readonly variables: MetadataBindings['variables'],
   ) {
-    super({ autoStart: true, maxBufferSize: 256 });
+    super({ autoStart: true, maxBufferSize: 128 });
     this.setProperty('metadata', {
       state: this.state,
       cardinality: { type: 'estimate', value: Number.POSITIVE_INFINITY },
       variables,
       next: [],
     } satisfies MetadataBindings);
-    producer((binding) => {
+    producer(async(binding) => {
+      await this.acquireSlot();
+      if (this.done) {
+        this.releaseSlot();
+        return;
+      }
       this.emitted++;
       this._push(binding);
     }).then(() => {
@@ -209,6 +216,38 @@ class StreamingBindingsIterator extends BufferedIterator<RDF.Bindings> {
 
   public override _read(_count: number, done: () => void): void {
     done();
+  }
+
+  public override read(): RDF.Bindings | null {
+    const binding = super.read();
+    if (binding !== null) {
+      this.releaseSlot();
+    }
+    return binding;
+  }
+
+  protected override _destroy(cause: Error | undefined, callback: (error?: Error) => void): void {
+    while (this.slotWaiters.length > 0) {
+      this.slotWaiters.shift()!();
+    }
+    super._destroy(cause, callback);
+  }
+
+  private async acquireSlot(): Promise<void> {
+    if (this.availableSlots > 0) {
+      this.availableSlots--;
+      return;
+    }
+    await new Promise<void>(resolve => this.slotWaiters.push(resolve));
+  }
+
+  private releaseSlot(): void {
+    const waiter = this.slotWaiters.shift();
+    if (waiter) {
+      waiter();
+    } else {
+      this.availableSlots++;
+    }
   }
 }
 
@@ -357,7 +396,7 @@ export class QuerySourceSmartKg implements IQuerySource {
     operation: Algebra.Operation,
     context: IActionContext,
     options: IQueryBindingsOptions | undefined,
-    emit: (binding: RDF.Bindings) => void,
+    emit: (binding: RDF.Bindings) => Promise<void>,
   ): Promise<void> {
     if (isKnownOperation(operation, Algebra.Types.BGP)) {
       await this.streamPatternsByStars(operation.patterns, context, options, emit);
@@ -373,7 +412,7 @@ export class QuerySourceSmartKg implements IQuerySource {
     }
 
     for (const binding of await this.evaluateOperation(operation, context, options)) {
-      emit(binding);
+      await emit(binding);
     }
   }
 
@@ -381,7 +420,7 @@ export class QuerySourceSmartKg implements IQuerySource {
     patterns: Algebra.Pattern[],
     context: IActionContext,
     options: IQueryBindingsOptions | undefined,
-    emit: (binding: RDF.Bindings) => void,
+    emit: (binding: RDF.Bindings) => Promise<void>,
   ): Promise<void> {
     const stars = await this.orderStarsForExecution(groupPatternsBySubject(patterns), context);
     let results: RDF.Bindings[] = [ await this.emptyBinding() ];
@@ -1123,7 +1162,7 @@ export class QuerySourceSmartKg implements IQuerySource {
     operation: Algebra.Operation,
     context: IActionContext,
     options: IQueryBindingsOptions | undefined,
-    emit: (binding: RDF.Bindings) => void,
+    emit: (binding: RDF.Bindings) => Promise<void>,
   ): Promise<void> {
     if (!this.mediatorQuerySourceDereferenceLink) {
       return;
@@ -1133,7 +1172,6 @@ export class QuerySourceSmartKg implements IQuerySource {
     const handledDatasets: Record<string, boolean> = {};
     const queuedLinks = [ this.originalSourceUrl ];
     const seenLinks = new Set<string>();
-    const seenBindings = new Set<string>();
     const bindingsFactory = await this.getBindingsFactory();
     const leftRecords = leftBindings.map(bindingToRecord);
     const sharedVariables = getOperationVariables(operation)
@@ -1189,11 +1227,11 @@ export class QuerySourceSmartKg implements IQuerySource {
         for (const leftRecord of candidates) {
           if (areBindingRecordsCompatible(leftRecord, rightRecord)) {
             const binding = bindingsFactory.fromRecord({ ...leftRecord, ...rightRecord });
-            const key = bindingKey(binding);
-            if (!seenBindings.has(key)) {
-              seenBindings.add(key);
-              emit(binding);
-            }
+            // One HDT/TPF source exposes disjoint pages, while leftBindings is
+            // already deduplicated. Retaining a serialized key for every
+            // emitted result therefore consumed memory proportional to the
+            // complete answer without removing legitimate duplicates.
+            await emit(binding);
           }
         }
       }
@@ -1389,7 +1427,7 @@ export class QuerySourceSmartKg implements IQuerySource {
   private async emitJoinedBindings(
     left: RDF.Bindings[],
     right: RDF.Bindings[],
-    emit: (binding: RDF.Bindings) => void,
+    emit: (binding: RDF.Bindings) => Promise<void>,
   ): Promise<void> {
     const bindingsFactory = await this.getBindingsFactory();
     const seen = new Set<string>();
@@ -1401,7 +1439,7 @@ export class QuerySourceSmartKg implements IQuerySource {
       const key = bindingKey(binding);
       if (!seen.has(key)) {
         seen.add(key);
-        emit(binding);
+        await emit(binding);
       }
     }
   }

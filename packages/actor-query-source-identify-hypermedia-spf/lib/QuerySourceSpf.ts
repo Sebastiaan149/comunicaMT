@@ -128,11 +128,6 @@ export class QuerySourceSpf implements IQuerySource {
           operation: { operationType: 'type', type: Algebra.Types.BGP },
           joinBindings: true,
         },
-        {
-          type: 'operation',
-          operation: { operationType: 'type', type: Algebra.Types.JOIN },
-          joinBindings: true,
-        },
       ],
     };
   }
@@ -154,7 +149,7 @@ export class QuerySourceSpf implements IQuerySource {
   ): BindingsStream {
     const patterns = this.getOperationPatterns(operation);
     const bgp = this.algebraFactory.createBgp(patterns);
-    const variables = getOperationVariables(bgp);
+    const variables = getPatternVariables(patterns);
     const rootIterator: IBindingChunkIterator = options?.joinBindings ?
       new BindingsStreamChunkIterator(options.joinBindings.bindings, this.maxMpR) :
       new RootBindingChunkIterator(this.bindingsFactory.bindings());
@@ -190,69 +185,18 @@ export class QuerySourceSpf implements IQuerySource {
     return `QuerySourceSpf(${this.referenceValue})`;
   }
 
-  // Return the Hydra control information used to build SPF request URLs.
-  public getControl(): ISpfSourceControl {
-    return {
-      searchForm: this.searchForm,
-      mappings: this.searchMappings,
-    };
-  }
-
-  // Fetch the first page for a star and the current input-binding chunk.
-  public async fetchFirstSpfPage(
-    star: ISpfStar,
-    bindings: BindingChunk,
-    context: IActionContext,
-  ): Promise<ISpfPage> {
-    return this.fetchSpfPage(star, bindings, context);
-  }
-
-  // Fetch a continuation page for a star and the current input-binding chunk.
-  public async fetchNextSpfPage(
-    star: ISpfStar,
-    bindings: BindingChunk,
-    context: IActionContext,
-    pageUrl: string,
-  ): Promise<ISpfPage> {
-    return this.fetchSpfPage(star, bindings, context, pageUrl);
-  }
-
-  // Match RDF quads from a page back into bindings for one star.
-  public matchPageToStarBindings(star: ISpfStar, page: ISpfPage): RDF.Bindings[] {
-    return matchStarResponse(star, page.quads, this.bindingsFactory);
-  }
-
-  // Join two chunks of bindings using compatible variable assignments.
-  public joinBindingChunks(left: BindingChunk, right: BindingChunk): BindingChunk {
-    return joinBindingSets(left, right, this.bindingsFactory);
-  }
-
-  // Extract supported pattern lists from the operation shape.
-  private getOperationPatterns(operation: Algebra.Operation): Algebra.Pattern[] {
-    if (isKnownOperation(operation, Algebra.Types.PATTERN)) {
-      return [ operation ];
-    }
-    if (isKnownOperation(operation, Algebra.Types.BGP)) {
-      return operation.patterns;
-    }
-    if (isKnownOperation(operation, Algebra.Types.JOIN)) {
-      const patterns = collectPatterns(operation);
-      if (patterns.length === 0) {
-        throw new Error(`Unsupported non-pattern JOIN operation for QuerySourceSpf.`);
-      }
-      return patterns;
-    }
-    throw new Error(`Unsupported operation type '${operation.type}' for QuerySourceSpf.`);
-  }
-
-  // Dereference an SPF URL and split metadata from data quads.
-  private async fetchSpfPage(
+  // Dereference one SPF page. Like QuerySourceQpf.match, this is the single
+  // request path for initial and continuation fragments.
+  public async fetchSpfPage(
     star: ISpfStar,
     bindings: BindingChunk,
     context: IActionContext,
     pageUrl?: string,
   ): Promise<ISpfPage> {
-    const url = createSpfRequestUrl(this.getControl(), star, deduplicateBindings(bindings), this.maxMpR, pageUrl);
+    const url = createSpfRequestUrl({
+      searchForm: this.searchForm,
+      mappings: this.searchMappings,
+    }, star, deduplicateBindings(bindings), this.maxMpR, pageUrl);
     const dereferenceRdfOutput = await this.mediatorDereferenceRdf.mediate({ context, url });
     const rdfMetadataOutput: IActorRdfMetadataOutput = await this.mediatorMetadata.mediate({
       context,
@@ -261,7 +205,13 @@ export class QuerySourceSpf implements IQuerySource {
       triples: dereferenceRdfOutput.metadata?.triples,
     });
 
-    const metadataQuads = await collectRdfStream(rdfMetadataOutput.metadata, 'SPF metadata');
+    // The metadata actor tees the response into metadata and data streams. Drain
+    // both branches concurrently: awaiting one branch first makes the other one
+    // buffer a complete page and can deadlock when stream high-water marks fill.
+    const [ metadataQuads, quads ] = await Promise.all([
+      collectRdfStream(rdfMetadataOutput.metadata, 'SPF metadata'),
+      collectRdfStream(rdfMetadataOutput.data, 'SPF data'),
+    ]);
     const { metadata } = await this.mediatorMetadataExtract.mediate({
       context,
       url: dereferenceRdfOutput.url,
@@ -269,8 +219,6 @@ export class QuerySourceSpf implements IQuerySource {
       requestTime: dereferenceRdfOutput.requestTime,
       headers: dereferenceRdfOutput.headers,
     });
-    const quads = await collectRdfStream(rdfMetadataOutput.data, 'SPF data');
-
     return {
       url: dereferenceRdfOutput.url,
       metadata,
@@ -278,6 +226,24 @@ export class QuerySourceSpf implements IQuerySource {
       cardinality: extractVoidTriples(metadataQuads) ?? extractMetadataCardinality(metadata),
       nextPageUrl: extractNextPageUrl(metadata),
     };
+  }
+
+  public matchPageToStarBindings(star: ISpfStar, page: ISpfPage): RDF.Bindings[] {
+    return matchStarResponse(star, page.quads, this.bindingsFactory);
+  }
+
+  public joinBindingChunks(left: BindingChunk, right: BindingChunk): BindingChunk {
+    return joinBindingSets(left, right, this.bindingsFactory);
+  }
+
+  private getOperationPatterns(operation: Algebra.Operation): Algebra.Pattern[] {
+    if (isKnownOperation(operation, Algebra.Types.PATTERN)) {
+      return [ operation ];
+    }
+    if (isKnownOperation(operation, Algebra.Types.BGP)) {
+      return operation.patterns;
+    }
+    throw new Error(`Attempted to pass non-pattern/BGP operation '${operation.type}' to QuerySourceSpf.`);
   }
 }
 
@@ -387,6 +353,12 @@ export function createSpfRequestUrl(
   maxMpR: number = DEFAULT_MAX_MPR,
   pageUrl?: string,
 ): string {
+  // A one-pattern star is exactly TPF/brTPF. Use that mature server path
+  // directly instead of invoking the SPF server's star-join machinery.
+  if (star.patterns.length === 1) {
+    return createTpfRequestUrl(control, star.patterns[0], bindings, maxMpR, pageUrl);
+  }
+
   const entries: Record<string, string> = {};
   entries[control.mappings.subject] = encodePatternTerm(star.subject);
   entries[control.mappings.triples] = String(star.patterns.length);
@@ -404,6 +376,39 @@ export function createSpfRequestUrl(
   }
 
   return control.searchForm.getUri(entries);
+}
+
+function createTpfRequestUrl(
+  control: ISpfSourceControl,
+  pattern: Algebra.Pattern,
+  bindings: BindingChunk,
+  maxMpR: number,
+  pageUrl?: string,
+): string {
+  const url = new URL(control.searchForm.dataset);
+  url.searchParams.set('subject', encodePatternTerm(pattern.subject));
+  url.searchParams.set('predicate', encodePatternTerm(pattern.predicate));
+  url.searchParams.set('object', encodePatternTerm(pattern.object));
+
+  const variables = [ pattern.subject, pattern.predicate, pattern.object ]
+    .filter((term): term is RDF.Variable => term.termType === 'Variable');
+  const relevant = deduplicateBindings(bindings).slice(0, maxMpR);
+  if (variables.some(variable => relevant.some(binding => binding.has(variable)))) {
+    const rows = relevant.map(binding => `(${variables
+      .map(variable => binding.get(variable) ? termToStringTtl(binding.get(variable)!) : 'UNDEF')
+      .join(' ')})`);
+    url.searchParams.set(
+      'values',
+      `(${variables.map(variable => `?${variable.value}`).join(' ')}) { ${rows.join(' ')} }`,
+    );
+  }
+  if (pageUrl) {
+    const page = new URL(pageUrl).searchParams.get('page');
+    if (page) {
+      url.searchParams.set('page', page);
+    }
+  }
+  return url.toString();
 }
 
 // Emits the initial empty binding chunk that starts BGP evaluation.
@@ -463,6 +468,7 @@ class StarPatternIterator implements IBindingChunkIterator {
   private currentSourceChunk: BindingChunk | undefined;
   private unreadMappings: BindingChunk = [];
   private firstPageConsumed = false;
+  private previousPageMappings = new Set<string>();
 
   public constructor(
     private readonly sourceIterator: IBindingChunkIterator,
@@ -476,7 +482,7 @@ class StarPatternIterator implements IBindingChunkIterator {
   public async getNext(): Promise<BindingChunk | undefined> {
     while (this.unreadMappings.length === 0) {
       if (this.currentPage?.nextPageUrl && this.currentSourceChunk) {
-        this.currentPage = await this.source.fetchNextSpfPage(
+        this.currentPage = await this.source.fetchSpfPage(
           this.star,
           this.currentSourceChunk,
           this.context,
@@ -488,6 +494,7 @@ class StarPatternIterator implements IBindingChunkIterator {
         if (!this.currentSourceChunk) {
           return;
         }
+        this.previousPageMappings.clear();
         this.currentPage = await this.fetchFirstPageForCurrentChunk();
         this.unreadMappings = this.joinCurrentPage();
       }
@@ -502,7 +509,7 @@ class StarPatternIterator implements IBindingChunkIterator {
       this.firstPageConsumed = true;
       return this.firstPage;
     }
-    return this.source.fetchFirstSpfPage(this.star, this.currentSourceChunk!, this.context);
+    return this.source.fetchSpfPage(this.star, this.currentSourceChunk!, this.context);
   }
 
   // Join current page matches with the current input chunk.
@@ -510,7 +517,21 @@ class StarPatternIterator implements IBindingChunkIterator {
     if (!this.currentPage || !this.currentSourceChunk) {
       return [];
     }
-    const starBindings = this.source.matchPageToStarBindings(this.star, this.currentPage);
+    const pageBindings = this.source.matchPageToStarBindings(this.star, this.currentPage);
+    // The server serializes a page's answer-stars as one RDF graph. When a
+    // subject straddles two pages, reconstructing bindings from that graph can
+    // repeat mappings from the preceding page. Suppress only this bounded page
+    // overlap instead of retaining every result of the query.
+    const currentPageMappings = new Set<string>();
+    const starBindings: RDF.Bindings[] = [];
+    for (const binding of pageBindings) {
+      const key = bindingKey(binding);
+      currentPageMappings.add(key);
+      if (!this.previousPageMappings.has(key)) {
+        starBindings.push(binding);
+      }
+    }
+    this.previousPageMappings = currentPageMappings;
     return this.source.joinBindingChunks(this.currentSourceChunk, starBindings);
   }
 }
@@ -538,7 +559,7 @@ class BasicGraphPatternIterator implements IBindingChunkIterator {
       const choice = this.selectedStar ?
           {
             star: this.selectedStar,
-            firstPage: await this.source.fetchFirstSpfPage(this.selectedStar, sourceChunk, this.context),
+            firstPage: await this.source.fetchSpfPage(this.selectedStar, sourceChunk, this.context),
           } :
         await this.chooseNextStar(this.stars, sourceChunk);
       if (choice.empty) {
@@ -576,7 +597,7 @@ class BasicGraphPatternIterator implements IBindingChunkIterator {
     let firstAbsentCount: ISpfStarChoice | undefined;
 
     for (const star of stars) {
-      const firstPage = await this.source.fetchFirstSpfPage(star, currentBindings, this.context);
+      const firstPage = await this.source.fetchSpfPage(star, currentBindings, this.context);
       const count = firstPage.cardinality;
       if (count === 0) {
         return { star, firstPage, count, empty: true };
@@ -595,7 +616,7 @@ class BasicGraphPatternIterator implements IBindingChunkIterator {
 
     return best ?? firstAbsentCount ?? {
       star: stars[0],
-      firstPage: await this.source.fetchFirstSpfPage(stars[0], currentBindings, this.context),
+      firstPage: await this.source.fetchSpfPage(stars[0], currentBindings, this.context),
     };
   }
 }
@@ -622,7 +643,6 @@ class QueryIterator {
 class SpfBindingsIterator extends BufferedIterator<RDF.Bindings> {
   private emitted = 0;
   private readonly state = new MetadataValidationState();
-  private readonly seenBindings = new Set<string>();
   private reading = false;
   private sourceEnded = false;
   private readonly readBatchSize: number;
@@ -666,11 +686,6 @@ class SpfBindingsIterator extends BufferedIterator<RDF.Bindings> {
         this.finish();
         return;
       }
-      const key = bindingKey(binding);
-      if (this.seenBindings.has(key)) {
-        continue;
-      }
-      this.seenBindings.add(key);
       this.emitted++;
       this._push(binding);
       pushed++;
@@ -786,17 +801,96 @@ function joinBindingSets(
   bindingsFactory: BindingsFactory,
 ): BindingChunk {
   const results: RDF.Bindings[] = [];
-  for (const leftBinding of left) {
-    const leftRecord = bindingToRecord(leftBinding);
+
+  // Index the right-hand page on a shared, frequently-bound variable. SPF
+  // VALUES responses normally share the star subject (or an object joining two
+  // stars), so this changes the hot path from |left|*|right| comparisons to
+  // linear index construction plus small compatibility buckets. Bindings where
+  // the index variable is UNDEF remain wildcard candidates, as required by
+  // SPARQL compatibility.
+  const indexVariable = findJoinIndexVariable(left, right);
+  if (indexVariable) {
+    const index = new Map<string, RDF.Bindings[]>();
+    const unbound: RDF.Bindings[] = [];
     for (const rightBinding of right) {
-      const rightRecord = bindingToRecord(rightBinding);
-      const merged = mergeRecords(leftRecord, rightRecord);
-      if (merged) {
-        results.push(bindingsFactory.fromRecord(merged));
+      const value = rightBinding.get(indexVariable);
+      if (!value) {
+        unbound.push(rightBinding);
+        continue;
+      }
+      const key = stableTermToString(value);
+      const bucket = index.get(key);
+      if (bucket) {
+        bucket.push(rightBinding);
+      } else {
+        index.set(key, [ rightBinding ]);
       }
     }
+
+    for (const leftBinding of left) {
+      const value = leftBinding.get(indexVariable);
+      if (value) {
+        appendCompatibleBindings(
+          leftBinding,
+          index.get(stableTermToString(value)) ?? [],
+          results,
+          bindingsFactory,
+        );
+        appendCompatibleBindings(leftBinding, unbound, results, bindingsFactory);
+      } else {
+        appendCompatibleBindings(leftBinding, right, results, bindingsFactory);
+      }
+    }
+    return results;
   }
-  return deduplicateBindings(results);
+
+  for (const leftBinding of left) {
+    appendCompatibleBindings(leftBinding, right, results, bindingsFactory);
+  }
+  // Do not deduplicate here: SPARQL uses bag semantics, and retaining a
+  // query-sized Set of emitted bindings makes large result sets unbounded.
+  return results;
+}
+
+function appendCompatibleBindings(
+  leftBinding: RDF.Bindings,
+  candidates: RDF.Bindings[],
+  output: RDF.Bindings[],
+  bindingsFactory: BindingsFactory,
+): void {
+  const leftRecord = bindingToRecord(leftBinding);
+  for (const rightBinding of candidates) {
+    const merged = mergeRecords(leftRecord, bindingToRecord(rightBinding));
+    if (merged) {
+      output.push(bindingsFactory.fromRecord(merged));
+    }
+  }
+}
+
+function findJoinIndexVariable(left: BindingChunk, right: BindingChunk): string | undefined {
+  const leftCounts = countBoundVariables(left);
+  const rightCounts = countBoundVariables(right);
+  let best: string | undefined;
+  let bestScore = 0;
+  for (const [ variable, leftCount ] of leftCounts) {
+    const rightCount = rightCounts.get(variable) ?? 0;
+    const score = leftCount * rightCount;
+    if (score > bestScore) {
+      best = variable;
+      bestScore = score;
+    }
+  }
+  return best;
+}
+
+function countBoundVariables(bindings: BindingChunk): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const binding of bindings) {
+    for (const [ variable ] of binding) {
+      counts.set(variable.value, (counts.get(variable.value) ?? 0) + 1);
+    }
+  }
+  return counts;
 }
 
 // Merge two variable records when shared variables agree.
@@ -902,50 +996,10 @@ function getBoundStarFields(
   return fields;
 }
 
-// Collect all pattern operations from a supported algebra tree.
-function collectPatterns(operation: Algebra.Operation): Algebra.Pattern[] {
-  const patterns: Algebra.Pattern[] = [];
-  collectPatternsRecursive(operation, patterns, new Set<Algebra.Pattern>());
-  return patterns;
-}
-
-// Recursively visit nested algebra inputs while avoiding duplicate patterns.
-function collectPatternsRecursive(
-  operation: Algebra.Operation,
-  patterns: Algebra.Pattern[],
-  seen: Set<Algebra.Pattern>,
-): void {
-  if (isKnownOperation(operation, Algebra.Types.PATTERN)) {
-    if (!seen.has(operation)) {
-      seen.add(operation);
-      patterns.push(operation);
-    }
-    return;
-  }
-
-  const operationLike = <Algebra.Operation & {
-    input?: Algebra.Operation | Algebra.Operation[];
-    patterns?: Algebra.Pattern[];
-  }> operation;
-  if (Array.isArray(operationLike.input)) {
-    for (const input of operationLike.input) {
-      collectPatternsRecursive(input, patterns, seen);
-    }
-  } else if (operationLike.input) {
-    collectPatternsRecursive(operationLike.input, patterns, seen);
-  }
-  if (Array.isArray(operationLike.patterns)) {
-    for (const pattern of operationLike.patterns) {
-      collectPatternsRecursive(pattern, patterns, seen);
-    }
-  }
-}
-
-// Determine metadata variables for a query operation.
-function getOperationVariables(operation: Algebra.Operation): MetadataBindings['variables'] {
+function getPatternVariables(patterns: Algebra.Pattern[]): MetadataBindings['variables'] {
   const seen = new Set<string>();
   const variables: MetadataBindings['variables'] = [];
-  for (const pattern of collectPatterns(operation)) {
+  for (const pattern of patterns) {
     for (const term of [ pattern.subject, pattern.predicate, pattern.object, pattern.graph ]) {
       if (term.termType === 'Variable' && !seen.has(term.value)) {
         seen.add(term.value);

@@ -477,7 +477,8 @@ class StarPatternIterator implements IBindingChunkIterator {
   private currentSourceChunk: BindingChunk | undefined;
   private unreadMappings: BindingChunk = [];
   private firstPageConsumed = false;
-  private previousPageMappings = new Set<string>();
+  private boundarySubject: string | undefined;
+  private boundarySubjectMappings = new Set<string>();
 
   public constructor(
     private readonly sourceIterator: IBindingChunkIterator,
@@ -503,7 +504,8 @@ class StarPatternIterator implements IBindingChunkIterator {
         if (!this.currentSourceChunk) {
           return;
         }
-        this.previousPageMappings.clear();
+        this.boundarySubject = undefined;
+        this.boundarySubjectMappings.clear();
         this.currentPage = await this.fetchFirstPageForCurrentChunk();
         this.unreadMappings = this.joinCurrentPage();
       }
@@ -528,21 +530,37 @@ class StarPatternIterator implements IBindingChunkIterator {
     }
     const pageBindings = this.source.matchPageToStarBindings(this.star, this.currentPage);
     // The server serializes a page's answer-stars as one RDF graph. When a
-    // subject straddles two pages, reconstructing bindings from that graph can
-    // repeat mappings from the preceding page. Suppress only this bounded page
-    // overlap instead of retaining every result of the query.
-    const currentPageMappings = new Set<string>();
+    // subject straddles several pages, reconstructing bindings from each graph
+    // can repeat mappings from any earlier page for that subject. Retain only
+    // the current boundary subject, rather than an unbounded query-wide set.
+    const lastSubject = pageBindings.length > 0 ? bindingSubjectKey(this.star, pageBindings.at(-1)!) : undefined;
+    const nextBoundaryMappings = lastSubject === this.boundarySubject ?
+      new Set(this.boundarySubjectMappings) :
+      new Set<string>();
     const starBindings: RDF.Bindings[] = [];
     for (const binding of pageBindings) {
       const key = bindingKey(binding);
-      currentPageMappings.add(key);
-      if (!this.previousPageMappings.has(key)) {
+      const subject = bindingSubjectKey(this.star, binding);
+      const seenAtBoundary = subject === this.boundarySubject && this.boundarySubjectMappings.has(key);
+      if (!seenAtBoundary) {
         starBindings.push(binding);
       }
+      if (subject === lastSubject) {
+        nextBoundaryMappings.add(key);
+      }
     }
-    this.previousPageMappings = currentPageMappings;
+    this.boundarySubject = lastSubject;
+    this.boundarySubjectMappings = nextBoundaryMappings;
     return this.source.joinBindingChunks(this.currentSourceChunk, starBindings);
   }
+}
+
+function bindingSubjectKey(star: ISpfStar, binding: RDF.Bindings): string {
+  if (star.subject.termType !== 'Variable') {
+    return stableTermToString(star.subject);
+  }
+  const subject = binding.get(star.subject);
+  return subject ? stableTermToString(subject) : `?${star.subject.value}`;
 }
 
 // Chains star iterators together to evaluate the complete BGP.

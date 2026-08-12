@@ -22,9 +22,8 @@ import { termToString as termToStringTtl } from 'rdf-string-ttl';
 import { Readable } from 'readable-stream';
 
 const VOID_TRIPLES = 'http://rdfs.org/ns/void#triples';
-// The SPF paper evaluates bounded blocks of 30 mappings. This also keeps
-// mobile-side VALUES requests and intermediate buffers small.
-const DEFAULT_MAX_MPR = 30;
+// Keep one VALUES block aligned with the server's bounded fragment page.
+const DEFAULT_MAX_MPR = 100;
 const SOURCE_TYPE = 'spf';
 
 export interface ISpfSearchMappings {
@@ -126,7 +125,10 @@ export class QuerySourceSpf implements IQuerySource {
         {
           type: 'operation',
           operation: { operationType: 'type', type: Algebra.Types.BGP },
-          joinBindings: true,
+        },
+        {
+          type: 'operation',
+          operation: { operationType: 'type', type: Algebra.Types.JOIN },
         },
       ],
     };
@@ -243,7 +245,10 @@ export class QuerySourceSpf implements IQuerySource {
     if (isKnownOperation(operation, Algebra.Types.BGP)) {
       return operation.patterns;
     }
-    throw new Error(`Attempted to pass non-pattern/BGP operation '${operation.type}' to QuerySourceSpf.`);
+    if (isKnownOperation(operation, Algebra.Types.JOIN)) {
+      return collectPatterns(operation);
+    }
+    throw new Error(`Attempted to pass unsupported operation '${operation.type}' to QuerySourceSpf.`);
   }
 }
 
@@ -994,6 +999,16 @@ function getBoundStarFields(
     addField(pattern.object, `o${position}`);
   }
   return fields;
+}
+
+function collectPatterns(operation: Algebra.Operation): Algebra.Pattern[] {
+  if (isKnownOperation(operation, Algebra.Types.PATTERN)) {
+    return [ operation ];
+  }
+  if (!isKnownOperation(operation, Algebra.Types.JOIN)) {
+    return [];
+  }
+  return operation.input.flatMap(collectPatterns);
 }
 
 function getPatternVariables(patterns: Algebra.Pattern[]): MetadataBindings['variables'] {

@@ -453,9 +453,7 @@ export class QuerySourceSmartKg implements IQuerySource {
         star.map(pattern => this.estimateOriginalSourcePatternCardinality(pattern, context)),
       )),
     })));
-    return estimated
-      .sort((left, right) => left.cardinality - right.cardinality)
-      .map(entry => entry.star);
+    return orderConnectedStarsByCardinality(estimated);
   }
 
   private async fetchSmartKgPlusStarOrder(
@@ -1627,6 +1625,39 @@ function groupPatternsBySubject(patterns: Algebra.Pattern[]): Algebra.Pattern[][
     stars.set(subject, bucket);
   }
   return [ ...stars.values() ];
+}
+
+function orderConnectedStarsByCardinality(
+  estimated: { star: Algebra.Pattern[]; cardinality: number }[],
+): Algebra.Pattern[][] {
+  const remaining = [ ...estimated ].sort((left, right) => left.cardinality - right.cardinality);
+  const first = remaining.shift();
+  if (!first) {
+    return [];
+  }
+
+  const ordered = [ first.star ];
+  const boundVariables = getStarVariableNames(first.star);
+  while (remaining.length > 0) {
+    const connectedIndex = remaining.findIndex(entry =>
+      [ ...getStarVariableNames(entry.star) ].some(variable => boundVariables.has(variable)));
+    const [ next ] = remaining.splice(connectedIndex < 0 ? 0 : connectedIndex, 1);
+    ordered.push(next.star);
+    for (const variable of getStarVariableNames(next.star)) {
+      boundVariables.add(variable);
+    }
+  }
+  return ordered;
+}
+
+function getStarVariableNames(patterns: Algebra.Pattern[]): Set<string> {
+  const variables = new Set<string>();
+  for (const pattern of patterns) {
+    for (const variable of getPatternVariableNames(pattern)) {
+      variables.add(variable);
+    }
+  }
+  return variables;
 }
 
 function serializeBgpForPlan(patterns: Algebra.Pattern[]): string {

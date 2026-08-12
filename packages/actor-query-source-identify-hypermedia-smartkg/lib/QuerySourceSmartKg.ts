@@ -61,7 +61,15 @@ type HdtDocument = {
 let hdtModulePromise: Promise<{ fromFile: (path: string) => Promise<HdtDocument> }> | undefined;
 const partitionDownloadPromises = new Map<string, Promise<string>>();
 const smartKgMetadataPromises = new Map<string, Promise<ISmartKgMetadata>>();
-const smartKgPlusPlanPromises = new Map<string, Promise<string[] | undefined>>();
+interface ISmartKgPlusPlanStep {
+  signature: string;
+  control: string;
+}
+interface IStarExecution {
+  patterns: Algebra.Pattern[];
+  control?: string;
+}
+const smartKgPlusPlanPromises = new Map<string, Promise<ISmartKgPlusPlanStep[] | undefined>>();
 
 async function loadHdtModule(): Promise<{ fromFile: (path: string) => Promise<HdtDocument> }> {
   if (!hdtModulePromise) {
@@ -411,13 +419,14 @@ export class QuerySourceSmartKg implements IQuerySource {
     const stars = await this.orderStarsForExecution(groupPatternsBySubject(patterns), context);
     let results: RDF.Bindings[] = [ await this.emptyBinding() ];
 
-    for (const [ index, starPatterns ] of stars.entries()) {
+    for (const [ index, star ] of stars.entries()) {
+      const starPatterns = star.patterns;
       if (index === stars.length - 1 && starPatterns.length === 1 &&
-        !await this.shouldUsePartitions(starPatterns[0], context)) {
+        !star.control && !await this.shouldUsePartitions(starPatterns[0], context)) {
         await this.streamJoinedFallbackBindings(results, starPatterns[0], context, options, emit);
         return;
       }
-      const starResults = await this.evaluateStar(starPatterns, context, options);
+      const starResults = await this.evaluateStar(starPatterns, context, options, star.control);
       if (index === stars.length - 1) {
         await this.emitJoinedBindings(results, starResults, emit);
         return;
@@ -432,16 +441,16 @@ export class QuerySourceSmartKg implements IQuerySource {
   private async orderStarsForExecution(
     stars: Algebra.Pattern[][],
     context: IActionContext,
-  ): Promise<Algebra.Pattern[][]> {
-    if (stars.length < 2) {
-      return stars;
-    }
-
+  ): Promise<IStarExecution[]> {
     if (this.smartKgPlusSource) {
       const planned = await this.fetchSmartKgPlusStarOrder(stars);
       if (planned) {
         return planned;
       }
+    }
+
+    if (stars.length < 2) {
+      return stars.map(patterns => ({ patterns }));
     }
 
     // The original SmartKG client planner orders subplans using the smallest
@@ -453,12 +462,12 @@ export class QuerySourceSmartKg implements IQuerySource {
         star.map(pattern => this.estimateOriginalSourcePatternCardinality(pattern, context)),
       )),
     })));
-    return orderConnectedStarsByCardinality(estimated);
+    return orderConnectedStarsByCardinality(estimated).map(patterns => ({ patterns }));
   }
 
   private async fetchSmartKgPlusStarOrder(
     stars: Algebra.Pattern[][],
-  ): Promise<Algebra.Pattern[][] | undefined> {
+  ): Promise<IStarExecution[] | undefined> {
     const patterns = stars.flat();
     // The SmartKG+ cost models require both values. They affect the shipping
     // annotation, while this client uses the server's cardinality-based star
@@ -488,13 +497,13 @@ export class QuerySourceSmartKg implements IQuerySource {
       }
 
       const bySignature = new Map(stars.map(star => [ starSignature(star), star ]));
-      const ordered: Algebra.Pattern[][] = [];
-      for (const control of controls) {
-        const star = bySignature.get(control);
-        if (!star || ordered.includes(star)) {
+      const ordered: IStarExecution[] = [];
+      for (const step of controls) {
+        const star = bySignature.get(step.signature);
+        if (!star || ordered.some(entry => entry.patterns === star)) {
           return undefined;
         }
-        ordered.push(star);
+        ordered.push({ patterns: star, control: step.control });
       }
       return ordered;
     } catch {
@@ -502,7 +511,7 @@ export class QuerySourceSmartKg implements IQuerySource {
     }
   }
 
-  private async fetchSmartKgPlusPlanSignatures(url: string): Promise<string[] | undefined> {
+  private async fetchSmartKgPlusPlanSignatures(url: string): Promise<ISmartKgPlusPlanStep[] | undefined> {
     try {
       const response = await this.mediatorHttp.mediate({ context: this.defaultContext, input: url });
       if (!response.ok) {
@@ -535,20 +544,51 @@ export class QuerySourceSmartKg implements IQuerySource {
     patterns: Algebra.Pattern[],
     context: IActionContext,
     options?: IQueryBindingsOptions,
+    control?: string,
   ): Promise<RDF.Bindings[]> {
+    if (this.smartKgPlusSource && control) {
+      return this.evaluateSmartKgPlusControlledStar(patterns, control, context, options);
+    }
     const metadata = await this.fetchMetadata();
     if (patterns.length >= 2 && isStarEligibleForPartitions(patterns, metadata)) {
       const partitionResults = await this.queryPatternsViaPartitions(patterns, context, options);
-      if (this.smartKgPlusSource) {
-        const sourceResults = await this.queryPatternsViaOriginalSource(patterns, context, options);
-        return deduplicateBindings([ ...partitionResults, ...sourceResults ]);
-      }
       if (partitionResults.length > 0) {
         return partitionResults;
       }
     }
 
     return this.queryPatternsViaOriginalSource(patterns, context, options);
+  }
+
+  private async evaluateSmartKgPlusControlledStar(
+    patterns: Algebra.Pattern[],
+    control: string,
+    context: IActionContext,
+    options?: IQueryBindingsOptions,
+  ): Promise<RDF.Bindings[]> {
+    const controlUrl = new URL(control, this.originalSourceUrl).toString();
+    if (new URL(controlUrl).pathname.includes('/molecule/')) {
+      const partitionPath = await this.fetchPartitionFileByUrl(controlUrl);
+      return this.evaluatePatternsOnPartition(partitionPath, patterns);
+    }
+    return this.queryPatternsViaSource(patterns, controlUrl, context, options);
+  }
+
+  private async queryPatternsViaSource(
+    patterns: Algebra.Pattern[],
+    sourceUrl: string,
+    context: IActionContext,
+    options?: IQueryBindingsOptions,
+  ): Promise<RDF.Bindings[]> {
+    let results: RDF.Bindings[] = [ await this.emptyBinding() ];
+    for (const pattern of await this.sortPatternsByOriginalSourceCardinality(patterns, context)) {
+      const stream = await this.queryFallbackBindings(pattern, context, options, sourceUrl);
+      results = await this.joinBindingsLists(results, await this.collectBindingsFromStream(stream));
+      if (results.length === 0) {
+        break;
+      }
+    }
+    return deduplicateBindings(results);
   }
 
   private async queryPatternsViaOriginalSource(
@@ -1016,16 +1056,18 @@ export class QuerySourceSmartKg implements IQuerySource {
     operation: Algebra.Operation,
     context: IActionContext,
     options?: IQueryBindingsOptions,
+    sourceUrl: string = this.originalSourceUrl,
   ): Promise<BindingsStream> {
     const variables = getOperationVariables(operation);
     return <BindingsStream><unknown>
-      new ArrayBindingsIterator(this.collectFallbackBindings(operation, context, options), variables);
+      new ArrayBindingsIterator(this.collectFallbackBindings(operation, context, options, sourceUrl), variables);
   }
 
   private async collectFallbackBindings(
     operation: Algebra.Operation,
     context: IActionContext,
     options?: IQueryBindingsOptions,
+    sourceUrl: string = this.originalSourceUrl,
   ): Promise<RDF.Bindings[]> {
     if (!this.mediatorQuerySourceDereferenceLink) {
       return [];
@@ -1033,7 +1075,7 @@ export class QuerySourceSmartKg implements IQuerySource {
 
     const fallbackContext = setContextFlag(context, 'smartkgFallback', true);
     const handledDatasets: Record<string, boolean> = {};
-    const queuedLinks: string[] = [ this.originalSourceUrl ];
+    const queuedLinks: string[] = [ sourceUrl ];
     const seenLinks = new Set<string>();
     const results: RDF.Bindings[] = [];
 
@@ -1061,7 +1103,7 @@ export class QuerySourceSmartKg implements IQuerySource {
       const streamNextLinks = getMetadataNextLinks(metadata);
       const nextLinks = streamNextLinks.length > 0 ? streamNextLinks : getMetadataNextLinks(sourceResult.metadata);
       for (const link of nextLinks) {
-        if (!seenLinks.has(link) && !isDatasetPageLink(link, this.originalSourceUrl)) {
+        if (!seenLinks.has(link) && !isDatasetPageLink(link, sourceUrl)) {
           queuedLinks.push(link);
         }
       }
@@ -1204,6 +1246,26 @@ export class QuerySourceSmartKg implements IQuerySource {
       return existingDownload;
     }
 
+    const download = this.downloadPartitionFile(partitionUrl, partitionPath);
+    partitionDownloadPromises.set(partitionPath, download);
+    try {
+      return await download;
+    } finally {
+      if (partitionDownloadPromises.get(partitionPath) === download) {
+        partitionDownloadPromises.delete(partitionPath);
+      }
+    }
+  }
+
+  private async fetchPartitionFileByUrl(partitionUrl: string): Promise<string> {
+    const partitionPath = join(this.cacheFolder, encodeURIComponent(partitionUrl));
+    if (isHdtFile(partitionPath)) {
+      return partitionPath;
+    }
+    const existingDownload = partitionDownloadPromises.get(partitionPath);
+    if (existingDownload) {
+      return existingDownload;
+    }
     const download = this.downloadPartitionFile(partitionUrl, partitionPath);
     partitionDownloadPromises.set(partitionPath, download);
     try {
@@ -1690,8 +1752,8 @@ function starSignature(patterns: Algebra.Pattern[]): string {
   ].join('|');
 }
 
-function flattenSmartKgPlusPlanStars(plan: unknown): string[] {
-  const signatures: string[] = [];
+function flattenSmartKgPlusPlanStars(plan: unknown): ISmartKgPlusPlanStep[] {
+  const steps: ISmartKgPlusPlanStep[] = [];
   const visit = (node: unknown): boolean => {
     if (!node || typeof node !== 'object') {
       return true;
@@ -1706,7 +1768,11 @@ function flattenSmartKgPlusPlanStars(plan: unknown): string[] {
     if (!record.operator || typeof record.operator !== 'object') {
       return false;
     }
-    const star = (<Record<string, unknown>> record.operator).star;
+    const operator = <Record<string, unknown>> record.operator;
+    const star = operator.star;
+    if (typeof operator.control !== 'string') {
+      return false;
+    }
     if (!star || typeof star !== 'object') {
       return false;
     }
@@ -1726,13 +1792,16 @@ function flattenSmartKgPlusPlanStars(plan: unknown): string[] {
       triples.push(`${serializePlanValue(tripleRecord.x, 'predicate')} ` +
         `${serializePlanValue(tripleRecord.y, 'object')}`);
     }
-    signatures.push([
-      serializePlanValue(starRecord.subject, 'subject'),
-      ...triples.sort(),
-    ].join('|'));
+    steps.push({
+      signature: [
+        serializePlanValue(starRecord.subject, 'subject'),
+        ...triples.sort(),
+      ].join('|'),
+      control: operator.control,
+    });
     return true;
   };
-  return visit(plan) ? signatures : [];
+  return visit(plan) ? steps : [];
 }
 
 function serializePlanValue(value: string, position: 'subject' | 'predicate' | 'object'): string {

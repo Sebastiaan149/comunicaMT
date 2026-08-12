@@ -4,12 +4,15 @@ import {
   createReadStream,
   createWriteStream,
   existsSync,
+  fstatSync,
   mkdirSync,
   openSync,
+  renameSync,
   readSync,
-  writeFileSync,
+  unlinkSync,
 } from 'node:fs';
 import { basename, isAbsolute, join } from 'node:path';
+import { pipeline } from 'node:stream/promises';
 import type { MediatorHttp } from '@comunica/bus-http';
 import { ActorHttp } from '@comunica/bus-http';
 import type {
@@ -51,6 +54,8 @@ type HdtDocument = {
 };
 let hdtModulePromise: Promise<{ fromFile: (path: string) => Promise<HdtDocument> }> | undefined;
 const partitionDownloadPromises = new Map<string, Promise<string>>();
+const smartKgMetadataPromises = new Map<string, Promise<ISmartKgMetadata>>();
+const smartKgPlusPlanPromises = new Map<string, Promise<string[] | undefined>>();
 
 async function loadHdtModule(): Promise<{ fromFile: (path: string) => Promise<HdtDocument> }> {
   if (!hdtModulePromise) {
@@ -190,6 +195,7 @@ export class QuerySourceSmartKg implements IQuerySource {
   private readonly originalSourceUrl: string;
   private readonly metadataUrl: string;
   private readonly partitionsBaseUrl: string;
+  private readonly planUrl: string;
   private readonly mediatorQuerySourceDereferenceLink?: any;
   private readonly smartKgPlusSource: boolean;
   private readonly hdtPatternCache = new Map<string, Promise<RDF.Bindings[]>>();
@@ -216,6 +222,7 @@ export class QuerySourceSmartKg implements IQuerySource {
     this.originalSourceUrl = normalizedUrl;
     this.metadataUrl = `${origin}/molecule/${datasetName}`;
     this.partitionsBaseUrl = `${origin}/molecule/${datasetName}`;
+    this.planUrl = `${origin}/plan`;
     this.smartKgPlusSource = datasetName.toLowerCase() === 'smartkg+';
     this.dataFactory = dataFactory;
     this.mediatorHttp = mediatorHttp;
@@ -346,7 +353,7 @@ export class QuerySourceSmartKg implements IQuerySource {
     options: IQueryBindingsOptions | undefined,
     emit: (binding: RDF.Bindings) => void,
   ): Promise<void> {
-    const stars = groupPatternsBySubject(patterns);
+    const stars = await this.orderStarsForExecution(groupPatternsBySubject(patterns), context);
     let results: RDF.Bindings[] = [ await this.emptyBinding() ];
 
     for (const [ index, starPatterns ] of stars.entries()) {
@@ -392,20 +399,106 @@ export class QuerySourceSmartKg implements IQuerySource {
     context: IActionContext,
     options?: IQueryBindingsOptions,
   ): Promise<RDF.Bindings[]> {
-    const stars = new Map<string, Algebra.Pattern[]>();
-    for (const pattern of patterns) {
-      const subject = termToString(pattern.subject);
-      const bucket = stars.get(subject) ?? [];
-      bucket.push(pattern);
-      stars.set(subject, bucket);
-    }
+    const stars = await this.orderStarsForExecution(groupPatternsBySubject(patterns), context);
 
     let results: RDF.Bindings[] = [ await this.emptyBinding() ];
-    for (const starPatterns of stars.values()) {
+    for (const starPatterns of stars) {
       const starResults = await this.evaluateStar(starPatterns, context, options);
       results = await this.joinBindingsLists(results, starResults);
+      if (results.length === 0) {
+        break;
+      }
     }
     return deduplicateBindings(results);
+  }
+
+  private async orderStarsForExecution(
+    stars: Algebra.Pattern[][],
+    context: IActionContext,
+  ): Promise<Algebra.Pattern[][]> {
+    if (stars.length < 2) {
+      return stars;
+    }
+
+    if (this.smartKgPlusSource) {
+      const planned = await this.fetchSmartKgPlusStarOrder(stars);
+      if (planned) {
+        return planned;
+      }
+    }
+
+    // The original SmartKG client planner orders subplans using the smallest
+    // TPF cardinality in every star. This also provides a safe fallback when
+    // a SmartKG+ server can not provide a plan.
+    const estimated = await Promise.all(stars.map(async star => ({
+      star,
+      cardinality: Math.min(...await Promise.all(
+        star.map(pattern => this.estimateOriginalSourcePatternCardinality(pattern, context)),
+      )),
+    })));
+    return estimated
+      .sort((left, right) => left.cardinality - right.cardinality)
+      .map(entry => entry.star);
+  }
+
+  private async fetchSmartKgPlusStarOrder(
+    stars: Algebra.Pattern[][],
+  ): Promise<Algebra.Pattern[][] | undefined> {
+    const patterns = stars.flat();
+    // The SmartKG+ cost models require both values. They affect the shipping
+    // annotation, while this client uses the server's cardinality-based star
+    // order and retains its completeness-preserving local strategy choice.
+    const parameters = new URLSearchParams({
+      bgp: serializeBgpForPlan(patterns),
+      speed: '100',
+      latency: '1',
+    });
+    const url = `${this.planUrl}?${parameters.toString()}`;
+    let planPromise = smartKgPlusPlanPromises.get(url);
+    if (!planPromise) {
+      planPromise = this.fetchSmartKgPlusPlanSignatures(url);
+      smartKgPlusPlanPromises.set(url, planPromise);
+      while (smartKgPlusPlanPromises.size > 128) {
+        const oldestUrl = smartKgPlusPlanPromises.keys().next().value;
+        if (oldestUrl === undefined) {
+          break;
+        }
+        smartKgPlusPlanPromises.delete(oldestUrl);
+      }
+    }
+    try {
+      const controls = await planPromise;
+      if (!controls || controls.length !== stars.length) {
+        return undefined;
+      }
+
+      const bySignature = new Map(stars.map(star => [ starSignature(star), star ]));
+      const ordered: Algebra.Pattern[][] = [];
+      for (const control of controls) {
+        const star = bySignature.get(control);
+        if (!star || ordered.includes(star)) {
+          return undefined;
+        }
+        ordered.push(star);
+      }
+      return ordered;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async fetchSmartKgPlusPlanSignatures(url: string): Promise<string[] | undefined> {
+    try {
+      const response = await this.mediatorHttp.mediate({ context: this.defaultContext, input: url });
+      if (!response.ok) {
+        return undefined;
+      }
+      const content = await readStreamToString(ActorHttp.toNodeReadable(response.body));
+      const controls = flattenSmartKgPlusPlanStars(<unknown> JSON.parse(content));
+      return controls.length > 0 ? controls : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   private async evaluatePattern(
@@ -994,8 +1087,12 @@ export class QuerySourceSmartKg implements IQuerySource {
 
   private async fetchMetadata(): Promise<ISmartKgMetadata> {
     if (!this.metadata) {
-      const metadataString = await this.fetchText(this.metadataUrl);
-      this.metadata = parseSmartKgMetadata(metadataString);
+      let metadataPromise = smartKgMetadataPromises.get(this.metadataUrl);
+      if (!metadataPromise) {
+        metadataPromise = this.fetchText(this.metadataUrl).then(parseSmartKgMetadata);
+        smartKgMetadataPromises.set(this.metadataUrl, metadataPromise);
+      }
+      this.metadata = await metadataPromise;
     }
     return this.metadata;
   }
@@ -1036,17 +1133,30 @@ export class QuerySourceSmartKg implements IQuerySource {
     if (!response.ok) {
       throw new Error(`SmartKG partition download failed with HTTP ${response.status}: ${partitionUrl}`);
     }
-    const body = ActorHttp.toNodeReadable(response.body);
-    const payload = await readStreamToBuffer(body);
-    writePartitionPayload(partitionPath, payload);
+    const temporaryPath = `${partitionPath}.download-${process.pid}-${Date.now()}`;
+    await pipeline(ActorHttp.toNodeReadable(response.body), createWriteStream(temporaryPath));
+    try {
+      if (isHdtFile(temporaryPath)) {
+        renameSync(temporaryPath, partitionPath);
+      } else {
+        await extractTarPartitionFile(temporaryPath, partitionPath);
+        unlinkSync(temporaryPath);
+      }
+    } catch (error) {
+      if (existsSync(temporaryPath)) {
+        unlinkSync(temporaryPath);
+      }
+      throw error;
+    }
     if (!existsSync(`${partitionPath}.index.v1-1`)) {
       const indexResponse = await this.mediatorHttp.mediate({
         context: this.defaultContext,
         input: `${partitionUrl}.index.v1-1`,
       });
       if (indexResponse.ok) {
-        const indexBody = ActorHttp.toNodeReadable(indexResponse.body);
-        writeFileSync(`${partitionPath}.index.v1-1`, await readStreamToBuffer(indexBody));
+        const temporaryIndexPath = `${partitionPath}.index.download-${process.pid}-${Date.now()}`;
+        await pipeline(ActorHttp.toNodeReadable(indexResponse.body), createWriteStream(temporaryIndexPath));
+        renameSync(temporaryIndexPath, `${partitionPath}.index.v1-1`);
       }
     }
     return partitionPath;
@@ -1423,6 +1533,89 @@ function groupPatternsBySubject(patterns: Algebra.Pattern[]): Algebra.Pattern[][
   return [ ...stars.values() ];
 }
 
+function serializeBgpForPlan(patterns: Algebra.Pattern[]): string {
+  return patterns
+    .map(pattern => `${serializeTermForPlan(pattern.subject)} ${serializeTermForPlan(pattern.predicate)} ` +
+      `${serializeTermForPlan(pattern.object)} .`)
+    .join('\n');
+}
+
+function serializeTermForPlan(term: RDF.Term): string {
+  if (term.termType === 'Variable') {
+    return `?${term.value}`;
+  }
+  if (term.termType === 'NamedNode') {
+    return `<${term.value}>`;
+  }
+  return termToString(term);
+}
+
+function starSignature(patterns: Algebra.Pattern[]): string {
+  return [
+    serializeTermForPlan(patterns[0].subject),
+    ...patterns
+      .map(pattern => `${serializeTermForPlan(pattern.predicate)} ${serializeTermForPlan(pattern.object)}`)
+      .sort(),
+  ].join('|');
+}
+
+function flattenSmartKgPlusPlanStars(plan: unknown): string[] {
+  const signatures: string[] = [];
+  const visit = (node: unknown): boolean => {
+    if (!node || typeof node !== 'object') {
+      return true;
+    }
+    const record = <Record<string, unknown>> node;
+    if (!visit(record.subplan)) {
+      return false;
+    }
+    if (record.operator === undefined) {
+      return true;
+    }
+    if (!record.operator || typeof record.operator !== 'object') {
+      return false;
+    }
+    const star = (<Record<string, unknown>> record.operator).star;
+    if (!star || typeof star !== 'object') {
+      return false;
+    }
+    const starRecord = <Record<string, unknown>> star;
+    if (typeof starRecord.subject !== 'string' || !Array.isArray(starRecord.triples)) {
+      return false;
+    }
+    const triples: string[] = [];
+    for (const triple of starRecord.triples) {
+      if (!triple || typeof triple !== 'object') {
+        return false;
+      }
+      const tripleRecord = <Record<string, unknown>> triple;
+      if (typeof tripleRecord.x !== 'string' || typeof tripleRecord.y !== 'string') {
+        return false;
+      }
+      triples.push(`${serializePlanValue(tripleRecord.x, 'predicate')} ` +
+        `${serializePlanValue(tripleRecord.y, 'object')}`);
+    }
+    signatures.push([
+      serializePlanValue(starRecord.subject, 'subject'),
+      ...triples.sort(),
+    ].join('|'));
+    return true;
+  };
+  return visit(plan) ? signatures : [];
+}
+
+function serializePlanValue(value: string, position: 'subject' | 'predicate' | 'object'): string {
+  const trimmed = value.trim();
+  if (trimmed.startsWith('?') || trimmed.startsWith('_:') ||
+    (trimmed.startsWith('<') && trimmed.endsWith('>'))) {
+    return trimmed;
+  }
+  if (position !== 'object' || /^[a-z][a-z\d+.-]*:/iu.test(trimmed)) {
+    return `<${trimmed}>`;
+  }
+  return trimmed;
+}
+
 function getMetadataNextLinks(metadata: MetadataBindings | Record<string, unknown> | undefined): string[] {
   const next = (<Record<string, unknown> | undefined> metadata)?.next;
   if (Array.isArray(next)) {
@@ -1657,36 +1850,6 @@ function parseTpfCardinality(content: string): number | undefined {
   return match ? Number(match[1]) : undefined;
 }
 
-async function readStreamToBuffer(stream: NodeJS.ReadableStream): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of <AsyncIterable<Buffer | string>><any> stream) {
-    chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
-  }
-  return Buffer.concat(chunks);
-}
-
-function writePartitionPayload(partitionPath: string, payload: Buffer): void {
-  if (isHdtBuffer(payload)) {
-    writeFileSync(partitionPath, payload);
-    return;
-  }
-
-  const entries = extractTarEntries(payload);
-  const hdtEntry = entries.find(entry => entry.name.endsWith('.hdt') && !entry.name.endsWith('.index.v1-1'));
-  if (!hdtEntry) {
-    throw new Error('SmartKG partition response did not contain a valid HDT payload.');
-  }
-  if (!isHdtBuffer(hdtEntry.payload)) {
-    throw new Error(`SmartKG partition archive entry is not valid HDT: ${hdtEntry.name}`);
-  }
-
-  writeFileSync(partitionPath, hdtEntry.payload);
-  const indexEntry = entries.find(entry => entry.name === `${hdtEntry.name}.index.v1-1`);
-  if (indexEntry) {
-    writeFileSync(`${partitionPath}.index.v1-1`, indexEntry.payload);
-  }
-}
-
 function isHdtBuffer(buffer: Buffer): boolean {
   return buffer.subarray(0, 4).toString('utf8') === '$HDT';
 }
@@ -1704,34 +1867,46 @@ function isHdtFile(path: string): boolean {
   }
 }
 
-function extractTarEntries(buffer: Buffer): { name: string; payload: Buffer }[] {
-  const entries: { name: string; payload: Buffer }[] = [];
-  let offset = 0;
-
-  while (offset + 512 <= buffer.length) {
-    const header = buffer.subarray(offset, offset + 512);
-    if (header.every(byte => byte === 0)) {
-      break;
+async function extractTarPartitionFile(archivePath: string, partitionPath: string): Promise<void> {
+  const fd = openSync(archivePath, 'r');
+  let hdtFound = false;
+  try {
+    const archiveSize = fstatSync(fd).size;
+    let offset = 0;
+    while (offset + 512 <= archiveSize) {
+      const header = Buffer.allocUnsafe(512);
+      if (readSync(fd, header, 0, header.length, offset) !== header.length || header.every(byte => byte === 0)) {
+        break;
+      }
+      const name = header.subarray(0, 100).toString('utf8').replace(/\0.*$/u, '');
+      const sizeText = header.subarray(124, 136).toString('utf8').replace(/\0.*$/u, '').trim();
+      const size = Number.parseInt(sizeText, 8);
+      const payloadStart = offset + 512;
+      const payloadEnd = payloadStart + size;
+      if (!name || !Number.isFinite(size) || size < 0 || payloadEnd > archiveSize) {
+        throw new Error('SmartKG partition response contained an invalid tar archive.');
+      }
+      let target: string | undefined;
+      if (name.endsWith('.hdt.index.v1-1')) {
+        target = `${partitionPath}.index.v1-1`;
+      } else if (name.endsWith('.hdt')) {
+        target = partitionPath;
+      }
+      if (target) {
+        await pipeline(
+          createReadStream(archivePath, { start: payloadStart, end: payloadEnd - 1 }),
+          createWriteStream(target),
+        );
+        hdtFound ||= target === partitionPath;
+      }
+      offset = payloadStart + Math.ceil(size / 512) * 512;
     }
-
-    const name = header.subarray(0, 100).toString('utf8').replace(/\0.*$/u, '');
-    const sizeText = header.subarray(124, 136).toString('utf8').replace(/\0.*$/u, '').trim();
-    const size = Number.parseInt(sizeText, 8);
-    if (!name || !Number.isFinite(size) || size < 0) {
-      break;
-    }
-
-    const payloadStart = offset + 512;
-    const payloadEnd = payloadStart + size;
-    if (payloadEnd > buffer.length) {
-      break;
-    }
-
-    entries.push({ name, payload: buffer.subarray(payloadStart, payloadEnd) });
-    offset = payloadStart + Math.ceil(size / 512) * 512;
+  } finally {
+    closeSync(fd);
   }
-
-  return entries;
+  if (!hdtFound || !isHdtFile(partitionPath)) {
+    throw new Error('SmartKG partition response did not contain a valid HDT payload.');
+  }
 }
 
 async function readFileUtf8(path: string): Promise<string> {

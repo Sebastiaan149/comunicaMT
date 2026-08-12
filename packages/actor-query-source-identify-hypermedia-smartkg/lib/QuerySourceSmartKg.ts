@@ -421,6 +421,11 @@ export class QuerySourceSmartKg implements IQuerySource {
 
     for (const [ index, star ] of stars.entries()) {
       const starPatterns = star.patterns;
+      if (this.smartKgPlusSource && index === stars.length - 1 && star.control &&
+        !new URL(star.control, this.originalSourceUrl).pathname.includes('/molecule/')) {
+        await this.streamSmartKgPlusControlledStar(starPatterns, results, star.control, context, options, emit);
+        return;
+      }
       if (index === stars.length - 1 && starPatterns.length === 1 &&
         !star.control && !await this.shouldUsePartitions(starPatterns[0], context)) {
         await this.streamJoinedFallbackBindings(results, starPatterns[0], context, options, emit);
@@ -566,12 +571,47 @@ export class QuerySourceSmartKg implements IQuerySource {
     context: IActionContext,
     options?: IQueryBindingsOptions,
   ): Promise<RDF.Bindings[]> {
-    const controlUrl = new URL(control, this.originalSourceUrl).toString();
-    if (new URL(controlUrl).pathname.includes('/molecule/')) {
+    const controlUrl = this.getSafeSmartKgPlusControlUrl(patterns, control);
+    const controlPath = new URL(controlUrl).pathname;
+
+    if (controlPath.includes('/molecule/')) {
       const partitionPath = await this.fetchPartitionFileByUrl(controlUrl);
       return this.evaluatePatternsOnPartition(partitionPath, patterns);
     }
     return this.queryPatternsViaSource(patterns, controlUrl, context, options);
+  }
+
+  private getSafeSmartKgPlusControlUrl(patterns: Algebra.Pattern[], control: string): string {
+    const controlUrl = new URL(control, this.originalSourceUrl).toString();
+    const controlPath = new URL(controlUrl).pathname;
+    const partitionControl = controlPath.includes('/molecule/') || controlPath.includes('/partition/');
+    // Older servers select the first typed family for stars that can span
+    // several families. Such a control is incomplete unless rdf:type is fixed.
+    return partitionControl && !hasConcreteTypeConstraint(patterns) ? this.originalSourceUrl : controlUrl;
+  }
+
+  private async streamSmartKgPlusControlledStar(
+    patterns: Algebra.Pattern[],
+    inputBindings: RDF.Bindings[],
+    control: string,
+    context: IActionContext,
+    options: IQueryBindingsOptions | undefined,
+    emit: (binding: RDF.Bindings) => Promise<void>,
+  ): Promise<void> {
+    const sourceUrl = this.getSafeSmartKgPlusControlUrl(patterns, control);
+    const orderedPatterns = await this.sortPatternsByOriginalSourceCardinality(patterns, context);
+    let results = inputBindings;
+    for (const [ index, pattern ] of orderedPatterns.entries()) {
+      const finalPattern = index === orderedPatterns.length - 1;
+      if (finalPattern) {
+        await this.streamSourcePatternWithInput(pattern, results, sourceUrl, context, options, emit);
+        return;
+      }
+      results = await this.querySourcePatternWithInput(pattern, results, sourceUrl, context, options);
+      if (results.length === 0) {
+        return;
+      }
+    }
   }
 
   private async queryPatternsViaSource(
@@ -582,13 +622,75 @@ export class QuerySourceSmartKg implements IQuerySource {
   ): Promise<RDF.Bindings[]> {
     let results: RDF.Bindings[] = [ await this.emptyBinding() ];
     for (const pattern of await this.sortPatternsByOriginalSourceCardinality(patterns, context)) {
-      const stream = await this.queryFallbackBindings(pattern, context, options, sourceUrl);
-      results = await this.joinBindingsLists(results, await this.collectBindingsFromStream(stream));
+      results = await this.querySourcePatternWithInput(pattern, results, sourceUrl, context, options);
       if (results.length === 0) {
         break;
       }
     }
     return deduplicateBindings(results);
+  }
+
+  private async querySourcePatternWithInput(
+    pattern: Algebra.Pattern,
+    inputBindings: RDF.Bindings[],
+    sourceUrl: string,
+    context: IActionContext,
+    options?: IQueryBindingsOptions,
+  ): Promise<RDF.Bindings[]> {
+    const results: RDF.Bindings[] = [];
+    for (const batch of chunkBindings(inputBindings, 30)) {
+      const stream = await this.queryFallbackBindings(
+        pattern,
+        context,
+        this.withJoinBindings(options, batch),
+        sourceUrl,
+      );
+      appendItems(results, await this.collectBindingsFromStream(stream));
+    }
+    return deduplicateBindings(results);
+  }
+
+  private async streamSourcePatternWithInput(
+    pattern: Algebra.Pattern,
+    inputBindings: RDF.Bindings[],
+    sourceUrl: string,
+    context: IActionContext,
+    options: IQueryBindingsOptions | undefined,
+    emit: (binding: RDF.Bindings) => Promise<void>,
+  ): Promise<void> {
+    for (const batch of chunkBindings(inputBindings, 30)) {
+      const stream = await this.queryFallbackBindings(
+        pattern,
+        context,
+        this.withJoinBindings(options, batch),
+        sourceUrl,
+      );
+      for await (const binding of <AsyncIterable<RDF.Bindings>><unknown> stream) {
+        await emit(binding);
+      }
+    }
+  }
+
+  private withJoinBindings(
+    options: IQueryBindingsOptions | undefined,
+    bindings: RDF.Bindings[],
+  ): IQueryBindingsOptions {
+    const variables = getBindingsVariables(bindings);
+    if (variables.length === 0) {
+      return { ...options };
+    }
+    return {
+      ...options,
+      joinBindings: {
+        bindings: <BindingsStream><unknown> new ArrayBindingsIterator(Promise.resolve(bindings), variables),
+        metadata: {
+          state: createMetadataValidationState(),
+          cardinality: { type: 'exact', value: bindings.length },
+          variables,
+          next: [],
+        },
+      },
+    };
   }
 
   private async queryPatternsViaOriginalSource(
@@ -1477,6 +1579,22 @@ function getOperationVariables(operation: Algebra.Operation): MetadataBindings['
   }
 
   return variables;
+}
+
+function getBindingsVariables(bindings: RDF.Bindings[]): MetadataBindings['variables'] {
+  const variables = new Map<string, RDF.Variable>();
+  for (const binding of bindings) {
+    for (const [ variable ] of binding) {
+      variables.set(variable.value, variable);
+    }
+  }
+  return [ ...variables.values() ].map(variable => ({ variable, canBeUndef: false }));
+}
+
+function* chunkBindings(bindings: RDF.Bindings[], size: number): IterableIterator<RDF.Bindings[]> {
+  for (let offset = 0; offset < bindings.length; offset += size) {
+    yield bindings.slice(offset, offset + size);
+  }
 }
 
 function collectPatterns(operation: Algebra.Operation): Algebra.Pattern[] {

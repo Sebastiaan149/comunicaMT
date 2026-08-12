@@ -539,6 +539,10 @@ export class QuerySourceSmartKg implements IQuerySource {
     const metadata = await this.fetchMetadata();
     if (patterns.length >= 2 && isStarEligibleForPartitions(patterns, metadata)) {
       const partitionResults = await this.queryPatternsViaPartitions(patterns, context, options);
+      if (this.smartKgPlusSource) {
+        const sourceResults = await this.queryPatternsViaOriginalSource(patterns, context, options);
+        return deduplicateBindings([ ...partitionResults, ...sourceResults ]);
+      }
       if (partitionResults.length > 0) {
         return partitionResults;
       }

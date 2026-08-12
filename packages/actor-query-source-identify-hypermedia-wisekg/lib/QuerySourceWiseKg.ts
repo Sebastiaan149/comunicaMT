@@ -1,7 +1,6 @@
 /* eslint-disable import/no-nodejs-modules */
 import { closeSync, existsSync, mkdirSync, openSync, readSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { Readable } from 'node:stream';
 
 import type { IActionHttp, IActorHttpOutput } from '@comunica/bus-http';
 import { ActorHttp } from '@comunica/bus-http';
@@ -20,7 +19,7 @@ import { Algebra, AlgebraFactory, isKnownOperation } from '@comunica/utils-algeb
 import type { BindingsFactory } from '@comunica/utils-bindings-factory';
 import type * as RDF from '@rdfjs/types';
 import type { AsyncIterator } from 'asynciterator';
-import { EmptyIterator, WrappingIterator } from 'asynciterator';
+import { BufferedIterator, EmptyIterator, WrappingIterator } from 'asynciterator';
 import { termToString } from 'rdf-string';
 import {
   getContextRaw,
@@ -141,34 +140,77 @@ class ArrayBindingsIterator extends WrappingIterator<RDF.Bindings> {
 }
 
 // Emits final bindings as soon as the plan executor produces them.
-class StreamingBindingsIterator extends WrappingIterator<RDF.Bindings> {
+class StreamingBindingsIterator extends BufferedIterator<RDF.Bindings> {
+  private emitted = 0;
+  private readonly state = createMetadataValidationState();
+  private availableSlots = 128;
+  private readonly slotWaiters: (() => void)[] = [];
+
   public constructor(
-    producer: (emit: (binding: RDF.Bindings) => void) => Promise<void>,
-    variables: MetadataBindings['variables'],
+    producer: (emit: (binding: RDF.Bindings) => Promise<void>) => Promise<void>,
+    private readonly variables: MetadataBindings['variables'],
   ) {
-    const source = new Readable({ objectMode: true, read: () => {} });
-    super(source);
-    let emitted = 0;
-    const state = createMetadataValidationState();
+    super({ autoStart: true, maxBufferSize: 128 });
     this.setProperty('metadata', {
-      state,
+      state: this.state,
       cardinality: { type: 'estimate', value: Number.POSITIVE_INFINITY },
       variables,
       next: [],
     } satisfies MetadataBindings);
-    producer((binding) => {
-      emitted++;
-      source.push(binding);
+    producer(async(binding) => {
+      await this.acquireSlot();
+      if (this.done) {
+        this.releaseSlot();
+        return;
+      }
+      this.emitted++;
+      this._push(binding);
     }).then(() => {
       this.setProperty('metadata', {
         state: createMetadataValidationState(),
-        cardinality: { type: 'exact', value: emitted },
-        variables,
+        cardinality: { type: 'exact', value: this.emitted },
+        variables: this.variables,
         next: [],
       } satisfies MetadataBindings);
-      state.invalidate();
-      source.push(null);
-    }).catch((error: unknown) => source.destroy(<Error> error));
+      this.state.invalidate();
+      this.close();
+    }).catch((error: unknown) => this.destroy(<Error> error));
+  }
+
+  public override _read(_count: number, done: () => void): void {
+    done();
+  }
+
+  public override read(): RDF.Bindings | null {
+    const binding = super.read();
+    if (binding !== null) {
+      this.releaseSlot();
+    }
+    return binding;
+  }
+
+  protected override _destroy(cause: Error | undefined, callback: (error?: Error) => void): void {
+    while (this.slotWaiters.length > 0) {
+      this.slotWaiters.shift()!();
+    }
+    super._destroy(cause, callback);
+  }
+
+  private async acquireSlot(): Promise<void> {
+    if (this.availableSlots > 0) {
+      this.availableSlots--;
+      return;
+    }
+    await new Promise<void>(resolve => this.slotWaiters.push(resolve));
+  }
+
+  private releaseSlot(): void {
+    const waiter = this.slotWaiters.shift();
+    if (waiter) {
+      waiter();
+    } else {
+      this.availableSlots++;
+    }
   }
 }
 
@@ -327,7 +369,7 @@ export class QuerySourceWiseKg implements IQuerySource {
     operation: Algebra.Operation,
     context: IActionContext,
     options: IQueryBindingsOptions | undefined,
-    emit: (binding: RDF.Bindings) => void,
+    emit: (binding: RDF.Bindings) => Promise<void>,
   ): Promise<void> {
     const patterns = isKnownOperation(operation, Algebra.Types.PATTERN) ?
         [ operation ] :
@@ -343,7 +385,7 @@ export class QuerySourceWiseKg implements IQuerySource {
     }
 
     for (const binding of await this.queryStarViaOriginalSourceWithRetry(patterns, context, options)) {
-      emit(binding);
+      await emit(binding);
     }
   }
 
@@ -527,7 +569,7 @@ export class QuerySourceWiseKg implements IQuerySource {
     fetchedPlan: IWiseKgFetchedPlan,
     context: IActionContext,
     options: IQueryBindingsOptions | undefined,
-    emit: (binding: RDF.Bindings) => void,
+    emit: (binding: RDF.Bindings) => Promise<void>,
   ): Promise<void> {
     let steps = [ ...fetchedPlan.steps ];
     if (fetchedPlan.expiresAt && Date.now() > fetchedPlan.expiresAt) {
@@ -594,14 +636,14 @@ export class QuerySourceWiseKg implements IQuerySource {
     inputBindings: RDF.Bindings[],
     context: IActionContext,
     options: IQueryBindingsOptions | undefined,
-    emit: (binding: RDF.Bindings) => void,
+    emit: (binding: RDF.Bindings) => Promise<void>,
   ): Promise<void> {
     const seen = new Set<string>();
-    const emitOnce = (binding: RDF.Bindings): void => {
+    const emitOnce = async(binding: RDF.Bindings): Promise<void> => {
       const key = bindingKey(binding);
       if (!seen.has(key)) {
         seen.add(key);
-        emit(binding);
+        await emit(binding);
       }
     };
 
@@ -612,7 +654,7 @@ export class QuerySourceWiseKg implements IQuerySource {
       const stepResults = await this.evaluatePatternsOnPartition(partitionPath, starPatterns);
       await this.emitJoinedBindings(inputBindings, stepResults, emitOnce);
       for (const binding of await this.queryOriginalStarWithInput(starPatterns, inputBindings, context, options)) {
-        emitOnce(binding);
+        await emitOnce(binding);
       }
       return;
     }
@@ -627,10 +669,10 @@ export class QuerySourceWiseKg implements IQuerySource {
           options,
         );
         for await (const binding of <AsyncIterable<RDF.Bindings>> <any> stream) {
-          emitOnce(binding);
+          await emitOnce(binding);
         }
         for (const binding of await this.queryOriginalStarWithInput(starPatterns, inputBindings, context, options)) {
-          emitOnce(binding);
+          await emitOnce(binding);
         }
         return;
       }
@@ -641,7 +683,7 @@ export class QuerySourceWiseKg implements IQuerySource {
         context,
         options,
       )) {
-        emitOnce(binding);
+        await emitOnce(binding);
       }
       return;
     }
@@ -1391,7 +1433,7 @@ export class QuerySourceWiseKg implements IQuerySource {
   private async emitJoinedBindings(
     left: RDF.Bindings[],
     right: RDF.Bindings[],
-    emit: (binding: RDF.Bindings) => void,
+    emit: (binding: RDF.Bindings) => Promise<void>,
   ): Promise<void> {
     const bindingsFactory = await this.getBindingsFactory();
     const seen = new Set<string>();
@@ -1403,7 +1445,7 @@ export class QuerySourceWiseKg implements IQuerySource {
       const key = bindingKey(binding);
       if (!seen.has(key)) {
         seen.add(key);
-        emit(binding);
+        await emit(binding);
       }
     }
   }

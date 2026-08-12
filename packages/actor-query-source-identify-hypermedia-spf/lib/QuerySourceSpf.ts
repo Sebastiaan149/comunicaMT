@@ -518,6 +518,7 @@ class StarPatternIterator implements IBindingChunkIterator {
 // Chains star iterators together to evaluate the complete BGP.
 class BasicGraphPatternIterator implements IBindingChunkIterator {
   private currentPipeline: IBindingChunkIterator | undefined;
+  private selectedStar: ISpfStar | undefined;
 
   public constructor(
     private readonly sourceIterator: IBindingChunkIterator,
@@ -534,12 +535,18 @@ class BasicGraphPatternIterator implements IBindingChunkIterator {
         return;
       }
 
-      const choice = await this.chooseNextStar(this.stars, sourceChunk);
+      const choice = this.selectedStar ?
+          {
+            star: this.selectedStar,
+            firstPage: await this.source.fetchFirstSpfPage(this.selectedStar, sourceChunk, this.context),
+          } :
+        await this.chooseNextStar(this.stars, sourceChunk);
       if (choice.empty) {
         continue;
       }
 
       const selectedStar = choice.star;
+      this.selectedStar = selectedStar;
       const rest = this.stars.filter(star => star !== selectedStar);
       const selectedIterator = new StarPatternIterator(
         new SingletonBindingChunkIterator(sourceChunk),

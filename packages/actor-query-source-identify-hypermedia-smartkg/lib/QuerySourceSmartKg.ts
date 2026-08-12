@@ -577,10 +577,9 @@ export class QuerySourceSmartKg implements IQuerySource {
   ): Promise<RDF.Bindings[]> {
     const usePartitions = await this.shouldUsePartitions(pattern, context);
     if (usePartitions) {
-      const partitionResults = await this.queryPatternsViaPartitions([ pattern ], context, options);
-      if (partitionResults.length > 0) {
-        return partitionResults;
-      }
+      // An empty partition result is authoritative. Retrying it through TPF
+      // turns a selective partition stage into an unbounded client-side scan.
+      return this.queryPatternsViaPartitions([ pattern ], context, options);
     }
     return this.collectBindingsFromStream(await this.queryFallbackBindings(pattern, context, options));
   }
@@ -592,10 +591,9 @@ export class QuerySourceSmartKg implements IQuerySource {
   ): Promise<RDF.Bindings[]> {
     const metadata = await this.fetchMetadata();
     if (patterns.length >= 2 && isStarEligibleForPartitions(patterns, metadata)) {
-      const partitionResults = await this.queryPatternsViaPartitions(patterns, context, options);
-      if (partitionResults.length > 0) {
-        return partitionResults;
-      }
+      // Eligibility and coverage were established from the metadata above;
+      // zero matches must therefore remain zero instead of triggering TPF.
+      return this.queryPatternsViaPartitions(patterns, context, options);
     }
 
     return this.queryPatternsViaOriginalSource(patterns, context, options);
@@ -1218,6 +1216,13 @@ export class QuerySourceSmartKg implements IQuerySource {
       if (!metadataPromise) {
         metadataPromise = this.fetchText(this.metadataUrl).then(parseSmartKgMetadata);
         smartKgMetadataPromises.set(this.metadataUrl, metadataPromise);
+        metadataPromise.catch(() => {
+          // Do not retain a rejected network request globally: a later query
+          // may safely retry after a transient server or connection failure.
+          if (smartKgMetadataPromises.get(this.metadataUrl) === metadataPromise) {
+            smartKgMetadataPromises.delete(this.metadataUrl);
+          }
+        });
       }
       this.metadata = await metadataPromise;
     }

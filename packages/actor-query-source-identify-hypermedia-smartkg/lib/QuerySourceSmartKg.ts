@@ -51,6 +51,12 @@ type HdtDocument = {
     object: RDF.Term,
     options: { offset: number; limit: number },
   ) => Promise<{ bindings?: RDF.Bindings[] }>;
+  countTriples: (
+    subject: RDF.Term,
+    predicate: RDF.Term,
+    object: RDF.Term,
+  ) => Promise<{ totalCount: number }>;
+  close: () => Promise<void>;
 };
 let hdtModulePromise: Promise<{ fromFile: (path: string) => Promise<HdtDocument> }> | undefined;
 const partitionDownloadPromises = new Map<string, Promise<string>>();
@@ -87,11 +93,18 @@ function createMetadataValidationState(): MetadataBindings['state'] {
 class HdtDocumentCache {
   private readonly cache = new Map<string, Promise<HdtDocument>>();
   private opening: Promise<void> = Promise.resolve();
-  private static readonly maxDocuments = 4;
+  // Native HDT documents map data and indexes outside the V8 heap. Keeping
+  // several large partitions open made the client retain many gigabytes even
+  // after a family had been evaluated. Two documents still permit reuse for a
+  // join while keeping memory bounded on mobile-class clients.
+  private static readonly maxDocuments = 2;
 
   public async getDocument(path: string): Promise<HdtDocument> {
     const existing = this.cache.get(path);
     if (existing) {
+      // Refresh the insertion order so this map acts as an LRU cache.
+      this.cache.delete(path);
+      this.cache.set(path, existing);
       return existing;
     }
     // The native HDT index builder is not safe when multiple unindexed partitions are opened concurrently.
@@ -103,13 +116,29 @@ class HdtDocumentCache {
       if (oldestPath === undefined) {
         break;
       }
+      const evicted = this.cache.get(oldestPath);
       this.cache.delete(oldestPath);
+      if (evicted) {
+        try {
+          await (await evicted).close();
+        } catch {
+          // A failed/opening document has no usable native handle to close.
+        }
+      }
     }
     return documentPromise;
   }
 
   public async dispose(): Promise<void> {
+    const documents = [ ...this.cache.values() ];
     this.cache.clear();
+    await Promise.all(documents.map(async(document) => {
+      try {
+        await (await document).close();
+      } catch {
+        // Ignore documents that failed while opening.
+      }
+    }));
   }
 }
 
@@ -303,6 +332,7 @@ export class QuerySourceSmartKg implements IQuerySource {
   }
 
   public async dispose(): Promise<void> {
+    this.hdtPatternCache.clear();
     await this.hdtCache.dispose();
   }
 
@@ -870,17 +900,94 @@ export class QuerySourceSmartKg implements IQuerySource {
     patterns: Algebra.Pattern[],
   ): Promise<RDF.Bindings[]> {
     const document = await this.hdtCache.getDocument(partitionPath);
-    let results: RDF.Bindings[] = [ await this.emptyBinding() ];
+    if (patterns.length === 0) {
+      return [ await this.emptyBinding() ];
+    }
+    if (patterns.length === 1) {
+      return this.collectCachedHdtBindings(partitionPath, document, patterns[0]);
+    }
 
-    for (const pattern of patterns) {
-      const bindings = await this.collectCachedHdtBindings(partitionPath, document, pattern);
-      results = deduplicateBindings(await this.joinBindingsLists(results, bindings));
+    // This follows the same cardinality-first, bounded pipeline principles as
+    // Comunica's TPF/brTPF bind joins. Only the smallest HDT pattern is
+    // materialized. Every later pattern is read page-by-page and immediately
+    // hash-joined, avoiding a second full-pattern array and repeated full-array
+    // deduplication at each star step.
+    const orderedPatterns = await this.orderPartitionPatternsByCardinality(document, patterns);
+    let results = await this.collectHdtBindings(document, orderedPatterns[0]);
+    for (const pattern of orderedPatterns.slice(1)) {
+      results = await this.joinBindingsWithHdtPattern(results, document, pattern);
       if (results.length === 0) {
-        break;
+        return [];
+      }
+    }
+    return results;
+  }
+
+  private async orderPartitionPatternsByCardinality(
+    document: HdtDocument,
+    patterns: Algebra.Pattern[],
+  ): Promise<Algebra.Pattern[]> {
+    const estimates = await Promise.all(patterns.map(async(pattern, position) => {
+      try {
+        const count = await document.countTriples(pattern.subject, pattern.predicate, pattern.object);
+        return { pattern, position, cardinality: count.totalCount };
+      } catch {
+        return { pattern, position, cardinality: Number.POSITIVE_INFINITY };
+      }
+    }));
+    return estimates
+      .sort((left, right) => left.cardinality - right.cardinality || left.position - right.position)
+      .map(entry => entry.pattern);
+  }
+
+  private async joinBindingsWithHdtPattern(
+    leftBindings: RDF.Bindings[],
+    document: HdtDocument,
+    pattern: Algebra.Pattern,
+  ): Promise<RDF.Bindings[]> {
+    if (leftBindings.length === 0) {
+      return [];
+    }
+
+    const bindingsFactory = await this.getBindingsFactory();
+    const leftRecords = leftBindings.map(bindingToRecord);
+    const sharedVariables = getPatternVariableNames(pattern)
+      .filter(variable => leftRecords.every(record => Boolean(record[variable])));
+    const index = new Map<string, Record<string, RDF.Term>[]>();
+    if (sharedVariables.length > 0) {
+      for (const record of leftRecords) {
+        const key = joinKey(record, sharedVariables);
+        const bucket = index.get(key);
+        if (bucket) {
+          bucket.push(record);
+        } else {
+          index.set(key, [ record ]);
+        }
       }
     }
 
-    return deduplicateBindings(results);
+    const results: RDF.Bindings[] = [];
+    const seen = new Set<string>();
+    await this.forEachHdtBindingsPage(document, pattern, (rightBindings) => {
+      for (const rightBinding of rightBindings) {
+        const rightRecord = bindingToRecord(rightBinding);
+        const candidates = sharedVariables.length > 0 ?
+          index.get(joinKey(rightRecord, sharedVariables)) ?? [] :
+          leftRecords;
+        for (const leftRecord of candidates) {
+          if (!areBindingRecordsCompatible(leftRecord, rightRecord)) {
+            continue;
+          }
+          const binding = bindingsFactory.fromRecord({ ...leftRecord, ...rightRecord });
+          const key = bindingKey(binding);
+          if (!seen.has(key)) {
+            seen.add(key);
+            results.push(binding);
+          }
+        }
+      }
+    });
+    return results;
   }
 
   private collectCachedHdtBindings(
@@ -895,7 +1002,20 @@ export class QuerySourceSmartKg implements IQuerySource {
     }
     const promise = this.collectHdtBindings(document, pattern);
     this.hdtPatternCache.set(cacheKey, promise);
-    while (this.hdtPatternCache.size > 8) {
+    // A cache of large binding arrays defeats HDT's compact representation and
+    // was the principal source of multi-gigabyte retention on 50M datasets.
+    // Keep only small reusable lookups; large scans remain page-bounded and are
+    // released as soon as their join stage completes.
+    promise.then((bindings) => {
+      if (bindings.length > 4_096 && this.hdtPatternCache.get(cacheKey) === promise) {
+        this.hdtPatternCache.delete(cacheKey);
+      }
+    }).catch(() => {
+      if (this.hdtPatternCache.get(cacheKey) === promise) {
+        this.hdtPatternCache.delete(cacheKey);
+      }
+    });
+    while (this.hdtPatternCache.size > 4) {
       const oldestKey = this.hdtPatternCache.keys().next().value;
       if (oldestKey === undefined) {
         break;
@@ -906,11 +1026,22 @@ export class QuerySourceSmartKg implements IQuerySource {
   }
 
   private async collectHdtBindings(document: HdtDocument, pattern: Algebra.Pattern): Promise<RDF.Bindings[]> {
-    const bindingsFactory = await this.getBindingsFactory();
-    const pageSize = 16_384;
-    let offset = 0;
     const results: RDF.Bindings[] = [];
+    await this.forEachHdtBindingsPage(document, pattern, bindings => appendItems(results, bindings));
+    return deduplicateBindings(results);
+  }
 
+  private async forEachHdtBindingsPage(
+    document: HdtDocument,
+    pattern: Algebra.Pattern,
+    consume: (bindings: RDF.Bindings[]) => void,
+  ): Promise<void> {
+    const bindingsFactory = await this.getBindingsFactory();
+    // Smaller than the old 16K page: this caps transient native/JS objects and
+    // yields often enough for low-end clients without turning HDT access into
+    // thousands of tiny calls.
+    const pageSize = 4_096;
+    let offset = 0;
     while (true) {
       const result = await document.searchBindings(
         bindingsFactory,
@@ -920,15 +1051,13 @@ export class QuerySourceSmartKg implements IQuerySource {
         { offset, limit: pageSize },
       );
       const bindings: RDF.Bindings[] = Array.isArray(result?.bindings) ? result.bindings : [];
-      appendItems(results, bindings);
-
+      consume(bindings);
       if (bindings.length < pageSize) {
-        break;
+        return;
       }
       offset += bindings.length;
+      await new Promise<void>(resolve => setImmediate(resolve));
     }
-
-    return deduplicateBindings(results);
   }
 
   private async queryFallbackBindings(
@@ -1486,6 +1615,20 @@ function collectRecordVariables(records: Record<string, RDF.Term>[]): Set<string
     }
   }
   return variables;
+}
+
+function getPatternVariableNames(pattern: Algebra.Pattern): string[] {
+  const variables = new Set<string>();
+  if (pattern.subject.termType === 'Variable') {
+    variables.add(pattern.subject.value);
+  }
+  if (pattern.predicate.termType === 'Variable') {
+    variables.add(pattern.predicate.value);
+  }
+  if (pattern.object.termType === 'Variable') {
+    variables.add(pattern.object.value);
+  }
+  return [ ...variables ];
 }
 
 function joinKey(record: Record<string, RDF.Term>, variables: string[]): string {

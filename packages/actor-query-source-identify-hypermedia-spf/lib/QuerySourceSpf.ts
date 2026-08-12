@@ -41,6 +41,9 @@ export interface ISpfSourceControl {
 export interface ISpfStar {
   subject: RDF.Term;
   patterns: Algebra.Pattern[];
+  // A residual star already has a selective TPF anchor in the pipeline. Keep
+  // this stage intact so its remaining patterns are joined in one SPF request.
+  anchored?: boolean;
 }
 
 export interface ISpfPage {
@@ -54,6 +57,7 @@ export interface ISpfPage {
 interface ISpfStarChoice {
   star: ISpfStar;
   firstPage: ISpfPage;
+  rest: ISpfStar[];
   count?: number;
   empty?: boolean;
 }
@@ -545,6 +549,7 @@ class StarPatternIterator implements IBindingChunkIterator {
 class BasicGraphPatternIterator implements IBindingChunkIterator {
   private currentPipeline: IBindingChunkIterator | undefined;
   private selectedStar: ISpfStar | undefined;
+  private selectedRest: ISpfStar[] | undefined;
 
   public constructor(
     private readonly sourceIterator: IBindingChunkIterator,
@@ -565,6 +570,7 @@ class BasicGraphPatternIterator implements IBindingChunkIterator {
           {
             star: this.selectedStar,
             firstPage: await this.source.fetchSpfPage(this.selectedStar, sourceChunk, this.context),
+            rest: this.selectedRest!,
           } :
         await this.chooseNextStar(this.stars, sourceChunk);
       if (choice.empty) {
@@ -573,7 +579,8 @@ class BasicGraphPatternIterator implements IBindingChunkIterator {
 
       const selectedStar = choice.star;
       this.selectedStar = selectedStar;
-      const rest = this.stars.filter(star => star !== selectedStar);
+      this.selectedRest = choice.rest;
+      const rest = choice.rest;
       const selectedIterator = new StarPatternIterator(
         new SingletonBindingChunkIterator(sourceChunk),
         selectedStar,
@@ -596,32 +603,49 @@ class BasicGraphPatternIterator implements IBindingChunkIterator {
     return result;
   }
 
-  // Select the next star using available cardinality estimates.
+  // Select a TPF anchor using cardinality estimates, then keep the remaining
+  // patterns of its subject together as one SPF stage. This follows Comunica's
+  // selective TPF start while retaining server-side star joins afterwards.
   private async chooseNextStar(stars: ISpfStar[], currentBindings: BindingChunk): Promise<ISpfStarChoice> {
     let best: ISpfStarChoice | undefined;
     let firstAbsentCount: ISpfStarChoice | undefined;
 
     for (const star of stars) {
-      const firstPage = await this.source.fetchSpfPage(star, currentBindings, this.context);
-      const count = firstPage.cardinality;
-      if (count === 0) {
-        return { star, firstPage, count, empty: true };
-      }
-      if (count === undefined) {
-        firstAbsentCount ??= { star, firstPage };
-        continue;
-      }
-      if (!Number.isFinite(count) || count < 0) {
-        throw new Error(`Malformed SPF metadata: invalid void:triples cardinality '${count}'.`);
-      }
-      if (!best || count < best.count!) {
-        best = { star, firstPage, count };
+      const anchors = star.anchored ?
+          [ star ] :
+        star.patterns.map(pattern => ({ subject: star.subject, patterns: [ pattern ]}));
+      // Probe serially: the number of probes is query-bounded, while parallel
+      // RDF parsers increase peak memory and listener pressure on small nodes.
+      for (const anchor of anchors) {
+        const firstPage = await this.source.fetchSpfPage(anchor, currentBindings, this.context);
+        const count = firstPage.cardinality;
+        const residualPatterns = star.anchored ?
+            [] :
+          star.patterns.filter(pattern => pattern !== anchor.patterns[0]);
+        const rest = stars.filter(candidate => candidate !== star);
+        if (residualPatterns.length > 0) {
+          rest.push({ subject: star.subject, patterns: residualPatterns, anchored: true });
+        }
+        if (count === 0) {
+          return { star: anchor, firstPage, rest, count, empty: true };
+        }
+        if (count === undefined) {
+          firstAbsentCount ??= { star: anchor, firstPage, rest };
+          continue;
+        }
+        if (!Number.isFinite(count) || count < 0) {
+          throw new Error(`Malformed SPF metadata: invalid void:triples cardinality '${count}'.`);
+        }
+        if (!best || count < best.count!) {
+          best = { star: anchor, firstPage, rest, count };
+        }
       }
     }
 
     return best ?? firstAbsentCount ?? {
       star: stars[0],
       firstPage: await this.source.fetchSpfPage(stars[0], currentBindings, this.context),
+      rest: stars.slice(1),
     };
   }
 }

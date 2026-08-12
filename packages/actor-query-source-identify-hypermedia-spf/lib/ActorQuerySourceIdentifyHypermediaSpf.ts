@@ -38,7 +38,7 @@ export class ActorQuerySourceIdentifyHypermediaSpf extends ActorQuerySourceIdent
     this.mediatorMetadataExtract = args.mediatorMetadataExtract;
     this.mediatorDereferenceRdf = args.mediatorDereferenceRdf;
     this.mediatorMergeBindingsContext = args.mediatorMergeBindingsContext;
-    this.maxMpR = args.maxMpR ?? 50;
+    this.maxMpR = args.maxMpR ?? 30;
   }
 
   // Accept forced SPF sources or metadata that exposes an SPF control.

@@ -359,47 +359,10 @@ export class QuerySourceWiseKg implements IQuerySource {
       throw new Error(`Unsupported operation type '${operation.type}' for QuerySourceWiseKg.`);
     }
 
-    if (patterns.length > 1) {
-      const fetchedPlan = await this.fetchWiseKgPlan(patterns, context);
-      if (fetchedPlan?.steps.some(step => this.isServerPartitionControl(step.control))) {
-        return this.queryStarViaOriginalSourceStream(patterns, context, options);
-      }
-    }
-
     return <BindingsStream> <unknown> new StreamingBindingsIterator(
       emit => this.streamOperation(operation, context, options, emit),
       getOperationVariables(operation),
     );
-  }
-
-  private async queryStarViaOriginalSourceStream(
-    patterns: Algebra.Pattern[],
-    context: IActionContext,
-    options?: IQueryBindingsOptions,
-  ): Promise<BindingsStream> {
-    const unboundOrder = await this.getUnboundOriginalSourceJoinOrder(patterns, context);
-    const orderedPatterns = unboundOrder ?? patterns;
-    const root = await this.emptyBinding();
-    return <BindingsStream> <unknown> new StreamingBindingsIterator(async(emit) => {
-      if (unboundOrder) {
-        for (const binding of await this.queryStarViaOriginalSourceUnbound(unboundOrder, context, options)) {
-          emit(binding);
-        }
-        return;
-      }
-      let results: RDF.Bindings[] = [ root ];
-      for (const [ index, pattern ] of orderedPatterns.entries()) {
-        results = await this.queryOriginalSourcePatternWithBindings(pattern, results, context, options);
-        if (results.length === 0) {
-          return;
-        }
-        if (index === orderedPatterns.length - 1) {
-          for (const binding of results) {
-            emit(binding);
-          }
-        }
-      }
-    }, getOperationVariables(new AlgebraFactory(<RDF.DataFactory> <unknown> this.dataFactory).createBgp(patterns)));
   }
 
   // Fetch a WiseKG plan for a BGP and execute it.
@@ -656,7 +619,7 @@ export class QuerySourceWiseKg implements IQuerySource {
 
     if (this.isServerSourceControl(step.control)) {
       if (this.isServerPartitionControl(step.control)) {
-        const stream = await this.queryPartitionStarBindings(
+        const stream = await this.queryServerStarBindings(
           starPatterns,
           inputBindings,
           step.control,
@@ -1127,8 +1090,9 @@ export class QuerySourceWiseKg implements IQuerySource {
   ): Promise<RDF.Bindings[]> {
     const sourceUrl = this.resolveControlUrl(control);
     if (this.isServerPartitionControl(control)) {
-      const stream = await this.queryPartitionStarBindings(patterns, inputBindings, control, context, options);
-      return this.collectBindingsFromStream(stream);
+      return this.collectBindingsFromStream(
+        await this.queryServerStarBindings(patterns, inputBindings, control, context, options),
+      );
     }
 
     if (sourceUrl === this.originalSourceUrl && await this.shouldQueryControlledSourceUnbound(
@@ -1153,7 +1117,8 @@ export class QuerySourceWiseKg implements IQuerySource {
     return this.deduplicateBindings(results);
   }
 
-  // Avoid issuing many equivalent bound requests when the complete fragment is cheaper to fetch once.
+  // Avoid issuing many equivalent bound requests when fetching a complete
+  // fragment once is cheaper than one request per incoming binding.
   private async shouldQueryControlledSourceUnbound(
     patterns: Algebra.Pattern[],
     inputBindings: RDF.Bindings[],
@@ -1174,6 +1139,8 @@ export class QuerySourceWiseKg implements IQuerySource {
     return totalCardinality <= inputBindings.length * 100;
   }
 
+  // Complete a planned star through the dataset source. Some generated
+  // molecule and SPF controls cover only a subset of the matching families.
   private async queryOriginalStarWithInput(
     patterns: Algebra.Pattern[],
     inputBindings: RDF.Bindings[],
@@ -1188,7 +1155,7 @@ export class QuerySourceWiseKg implements IQuerySource {
     return control.includes('/partition/') || control.startsWith('partition/');
   }
 
-  private async queryPartitionStarBindings(
+  private async queryServerStarBindings(
     patterns: Algebra.Pattern[],
     inputBindings: RDF.Bindings[],
     control: string,

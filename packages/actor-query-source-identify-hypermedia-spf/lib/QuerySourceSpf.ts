@@ -22,8 +22,9 @@ import { termToString as termToStringTtl } from 'rdf-string-ttl';
 import { Readable } from 'readable-stream';
 
 const VOID_TRIPLES = 'http://rdfs.org/ns/void#triples';
-const DEFAULT_MAX_MPR = 50;
-const MAX_PATTERNS_PER_SPF_STAR = 8;
+// The SPF paper evaluates bounded blocks of 30 mappings. This also keeps
+// mobile-side VALUES requests and intermediate buffers small.
+const DEFAULT_MAX_MPR = 30;
 const SOURCE_TYPE = 'spf';
 
 export interface ISpfSearchMappings {
@@ -158,7 +159,7 @@ export class QuerySourceSpf implements IQuerySource {
       new BindingsStreamChunkIterator(options.joinBindings.bindings, this.maxMpR) :
       new RootBindingChunkIterator(this.bindingsFactory.bindings());
     return <BindingsStream> <unknown> new SpfBindingsIterator(
-      Promise.resolve(new QueryIterator(
+      new QueryIterator(
         new BasicGraphPatternIterator(
           rootIterator,
           decomposeSubjectStars(bgp.patterns),
@@ -166,7 +167,7 @@ export class QuerySourceSpf implements IQuerySource {
           context,
           this.maxMpR,
         ),
-      )),
+      ),
       variables,
       this.maxMpR,
     );
@@ -361,7 +362,9 @@ export function detectSpfMappings(searchForm: ISearchForm): ISpfSearchMappings |
   }
 }
 
-// Split a BGP into subject stars that fit within the configured SPF size limit.
+// Split a BGP into maximal subject stars. SPF accepts an arbitrary number of
+// triple patterns per star, so keeping them intact lets the server perform the
+// complete star join and avoids sending its intermediate bindings to the client.
 export function decomposeSubjectStars(patterns: Algebra.Pattern[]): ISpfStar[] {
   const stars = new Map<string, ISpfStar>();
   for (const pattern of patterns) {
@@ -373,19 +376,7 @@ export function decomposeSubjectStars(patterns: Algebra.Pattern[]): ISpfStar[] {
       stars.set(key, { subject: pattern.subject, patterns: [ pattern ]});
     }
   }
-  const decomposedStars: ISpfStar[] = [];
-  for (const star of stars.values()) {
-    if (star.patterns.length <= MAX_PATTERNS_PER_SPF_STAR) {
-      decomposedStars.push(star);
-      continue;
-    }
-    const oversizedPatternCount = star.patterns.length - MAX_PATTERNS_PER_SPF_STAR;
-    for (let index = 0; index < oversizedPatternCount; index++) {
-      decomposedStars.push({ subject: star.subject, patterns: [ star.patterns[index] ]});
-    }
-    decomposedStars.push({ subject: star.subject, patterns: star.patterns.slice(oversizedPatternCount) });
-  }
-  return decomposedStars;
+  return [ ...stars.values() ];
 }
 
 // Build the concrete SPF request URL for one star and one binding chunk.
@@ -625,53 +616,70 @@ class SpfBindingsIterator extends BufferedIterator<RDF.Bindings> {
   private emitted = 0;
   private readonly state = new MetadataValidationState();
   private readonly seenBindings = new Set<string>();
+  private reading = false;
+  private sourceEnded = false;
+  private readonly readBatchSize: number;
 
   public constructor(
-    queryIteratorPromise: Promise<QueryIterator>,
+    private readonly queryIterator: QueryIterator,
     private readonly variables: MetadataBindings['variables'],
     maxBufferSize: number,
   ) {
     super({ autoStart: true, maxBufferSize });
+    this.readBatchSize = Math.max(1, Math.min(maxBufferSize, 64));
     this.setProperty('metadata', {
       state: this.state,
       cardinality: { type: 'estimate', value: Number.POSITIVE_INFINITY },
       variables,
       next: [],
     } satisfies MetadataBindings);
-    this.pushAll(queryIteratorPromise).catch(error => this.destroy(<Error> error));
-  }
-
-  private async pushAll(queryIteratorPromise: Promise<QueryIterator>): Promise<void> {
-    try {
-      const queryIterator = await queryIteratorPromise;
-      while (true) {
-        const binding = await queryIterator.getNextBinding();
-        if (!binding) {
-          break;
-        }
-        const key = bindingKey(binding);
-        if (this.seenBindings.has(key)) {
-          continue;
-        }
-        this.seenBindings.add(key);
-        this.emitted++;
-        this._push(binding);
-      }
-      this.setProperty('metadata', {
-        state: new MetadataValidationState(),
-        cardinality: { type: 'exact', value: this.emitted },
-        variables: this.variables,
-        next: [],
-      } satisfies MetadataBindings);
-      this.state.invalidate();
-      this.close();
-    } catch (error: unknown) {
-      this.destroy(<Error> error);
-    }
   }
 
   public override _read(_count: number, done: () => void): void {
-    done();
+    if (this.reading || this.sourceEnded) {
+      done();
+      return;
+    }
+    this.reading = true;
+    this.readNext().then(() => {
+      this.reading = false;
+      done();
+    }, (error: unknown) => {
+      this.reading = false;
+      this.destroy(<Error> error);
+      done();
+    });
+  }
+
+  private async readNext(): Promise<void> {
+    let pushed = 0;
+    while (pushed < this.readBatchSize) {
+      const binding = await this.queryIterator.getNextBinding();
+      if (!binding) {
+        this.finish();
+        return;
+      }
+      const key = bindingKey(binding);
+      if (this.seenBindings.has(key)) {
+        continue;
+      }
+      this.seenBindings.add(key);
+      this.emitted++;
+      this._push(binding);
+      pushed++;
+    }
+  }
+
+  private finish(): void {
+    this.sourceEnded = true;
+    this.setProperty('metadata', {
+      state: new MetadataValidationState(),
+      cardinality: { type: 'exact', value: this.emitted },
+      variables: this.variables,
+      next: [],
+    } satisfies MetadataBindings);
+    this.state.invalidate();
+    this.close();
   }
 }
 

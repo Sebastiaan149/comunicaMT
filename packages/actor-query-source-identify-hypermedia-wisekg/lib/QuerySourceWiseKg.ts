@@ -1,6 +1,7 @@
 /* eslint-disable import/no-nodejs-modules */
 import { closeSync, existsSync, mkdirSync, openSync, readSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { Readable } from 'node:stream';
 
 import type { IActionHttp, IActorHttpOutput } from '@comunica/bus-http';
 import { ActorHttp } from '@comunica/bus-http';
@@ -19,7 +20,7 @@ import { Algebra, AlgebraFactory, isKnownOperation } from '@comunica/utils-algeb
 import type { BindingsFactory } from '@comunica/utils-bindings-factory';
 import type * as RDF from '@rdfjs/types';
 import type { AsyncIterator } from 'asynciterator';
-import { BufferedIterator, EmptyIterator } from 'asynciterator';
+import { EmptyIterator, WrappingIterator } from 'asynciterator';
 import { termToString } from 'rdf-string';
 import {
   getContextRaw,
@@ -89,6 +90,7 @@ function createMetadataValidationState(): MetadataBindings['state'] {
 class HdtDocumentCache {
   private readonly cache = new Map<string, Promise<HdtDocument>>();
   private opening: Promise<void> = Promise.resolve();
+  private static readonly maxDocuments = 4;
 
   // Load or reuse the HDT document for a partition file.
   public async getDocument(path: string): Promise<HdtDocument> {
@@ -99,6 +101,13 @@ class HdtDocumentCache {
     const documentPromise = this.opening.then(async() => (await loadHdtModule()).fromFile(path));
     this.opening = documentPromise.then(() => {}, () => {});
     this.cache.set(path, documentPromise);
+    while (this.cache.size > HdtDocumentCache.maxDocuments) {
+      const oldestPath = this.cache.keys().next().value;
+      if (oldestPath === undefined) {
+        break;
+      }
+      this.cache.delete(oldestPath);
+    }
     return documentPromise;
   }
 
@@ -109,71 +118,57 @@ class HdtDocumentCache {
 }
 
 // Wraps an array-producing promise as a Comunica bindings stream.
-class ArrayBindingsIterator extends BufferedIterator<RDF.Bindings> {
+class ArrayBindingsIterator extends WrappingIterator<RDF.Bindings> {
   public constructor(bindingsPromise: Promise<RDF.Bindings[]>, variables: MetadataBindings['variables']) {
-    super({ autoStart: true, maxBufferSize: 256 });
-    this.pushAll(bindingsPromise, variables).catch(error => this.destroy(<Error> error));
-  }
-
-  private async pushAll(
-    bindingsPromise: Promise<RDF.Bindings[]>,
-    variables: MetadataBindings['variables'],
-  ): Promise<void> {
-    try {
-      const bindings = await bindingsPromise;
+    super(bindingsPromise);
+    const state = createMetadataValidationState();
+    this.setProperty('metadata', {
+      state,
+      cardinality: { type: 'estimate', value: Number.POSITIVE_INFINITY },
+      variables,
+      next: [],
+    } satisfies MetadataBindings);
+    bindingsPromise.then((bindings) => {
       this.setProperty('metadata', {
         state: createMetadataValidationState(),
         cardinality: { type: 'exact', value: bindings.length },
         variables,
         next: [],
       } satisfies MetadataBindings);
-      for (const binding of bindings) {
-        this._push(binding);
-      }
-      this.close();
-    } catch (error) {
-      this.destroy(<Error> error);
-    }
-  }
-
-  public override _read(_count: number, done: () => void): void {
-    done();
+      state.invalidate();
+    }).catch(() => {});
   }
 }
 
 // Emits final bindings as soon as the plan executor produces them.
-class StreamingBindingsIterator extends BufferedIterator<RDF.Bindings> {
-  private emitted = 0;
-  private readonly state = createMetadataValidationState();
-
+class StreamingBindingsIterator extends WrappingIterator<RDF.Bindings> {
   public constructor(
     producer: (emit: (binding: RDF.Bindings) => void) => Promise<void>,
-    private readonly variables: MetadataBindings['variables'],
+    variables: MetadataBindings['variables'],
   ) {
-    super({ autoStart: true, maxBufferSize: 256 });
+    const source = new Readable({ objectMode: true, read: () => {} });
+    super(source);
+    let emitted = 0;
+    const state = createMetadataValidationState();
     this.setProperty('metadata', {
-      state: this.state,
+      state,
       cardinality: { type: 'estimate', value: Number.POSITIVE_INFINITY },
       variables,
       next: [],
     } satisfies MetadataBindings);
     producer((binding) => {
-      this.emitted++;
-      this._push(binding);
+      emitted++;
+      source.push(binding);
     }).then(() => {
       this.setProperty('metadata', {
         state: createMetadataValidationState(),
-        cardinality: { type: 'exact', value: this.emitted },
-        variables: this.variables,
+        cardinality: { type: 'exact', value: emitted },
+        variables,
         next: [],
       } satisfies MetadataBindings);
-      this.state.invalidate();
-      this.close();
-    }).catch(error => this.destroy(<Error> error));
-  }
-
-  public override _read(_count: number, done: () => void): void {
-    done();
+      state.invalidate();
+      source.push(null);
+    }).catch((error: unknown) => source.destroy(<Error> error));
   }
 }
 
@@ -205,8 +200,12 @@ export class QuerySourceWiseKg implements IQuerySource {
     mediatorQuerySourceDereferenceLink?: any,
   ) {
     const normalizedUrl = normalizeUrl(url);
-    const datasetName = normalizedUrl.split('/').filter(Boolean).pop() ?? 'wisekg';
-    const origin = normalizedUrl.replace(/\/$/u, '').replace(/\/[^/]+$/u, '');
+    const sourceLocation = new URL(normalizedUrl);
+    const datasetName = sourceLocation.pathname.split('/').filter(Boolean).at(-1);
+    if (!datasetName) {
+      throw new Error(`WiseKG source URL must identify a dataset path: ${url}`);
+    }
+    const origin = sourceLocation.origin;
 
     this.referenceValue = normalizedUrl;
     this.originalSourceUrl = normalizedUrl;
@@ -270,11 +269,14 @@ export class QuerySourceWiseKg implements IQuerySource {
     options?: IQueryBindingsOptions,
   ): BindingsStream {
     const variables = getOperationVariables(operation);
-    return <BindingsStream> <unknown>
-      new StreamingBindingsIterator(
-        emit => this.streamOperation(operation, context, options, emit),
-        variables,
-      );
+    const iterator = new WrappingIterator<RDF.Bindings>(this.createBindingsStream(operation, context, options));
+    iterator.setProperty('metadata', {
+      state: createMetadataValidationState(),
+      cardinality: { type: 'estimate', value: Number.POSITIVE_INFINITY },
+      variables,
+      next: [],
+    } satisfies MetadataBindings);
+    return <BindingsStream> <unknown> iterator;
   }
 
   // Return no quads because WiseKG evaluation produces bindings.
@@ -343,6 +345,61 @@ export class QuerySourceWiseKg implements IQuerySource {
     for (const binding of await this.queryStarViaOriginalSourceWithRetry(patterns, context, options)) {
       emit(binding);
     }
+  }
+
+  private async createBindingsStream(
+    operation: Algebra.Operation,
+    context: IActionContext,
+    options?: IQueryBindingsOptions,
+  ): Promise<BindingsStream> {
+    const patterns = isKnownOperation(operation, Algebra.Types.PATTERN) ?
+        [ operation ] :
+      collectPatterns(operation);
+    if (patterns.length === 0) {
+      throw new Error(`Unsupported operation type '${operation.type}' for QuerySourceWiseKg.`);
+    }
+
+    if (patterns.length > 1) {
+      const fetchedPlan = await this.fetchWiseKgPlan(patterns, context);
+      if (fetchedPlan?.steps.some(step => this.isServerPartitionControl(step.control))) {
+        return this.queryStarViaOriginalSourceStream(patterns, context, options);
+      }
+    }
+
+    return <BindingsStream> <unknown> new StreamingBindingsIterator(
+      emit => this.streamOperation(operation, context, options, emit),
+      getOperationVariables(operation),
+    );
+  }
+
+  private async queryStarViaOriginalSourceStream(
+    patterns: Algebra.Pattern[],
+    context: IActionContext,
+    options?: IQueryBindingsOptions,
+  ): Promise<BindingsStream> {
+    const unboundOrder = await this.getUnboundOriginalSourceJoinOrder(patterns, context);
+    const orderedPatterns = unboundOrder ?? patterns;
+    const root = await this.emptyBinding();
+    return <BindingsStream> <unknown> new StreamingBindingsIterator(async(emit) => {
+      if (unboundOrder) {
+        for (const binding of await this.queryStarViaOriginalSourceUnbound(unboundOrder, context, options)) {
+          emit(binding);
+        }
+        return;
+      }
+      let results: RDF.Bindings[] = [ root ];
+      for (const [ index, pattern ] of orderedPatterns.entries()) {
+        results = await this.queryOriginalSourcePatternWithBindings(pattern, results, context, options);
+        if (results.length === 0) {
+          return;
+        }
+        if (index === orderedPatterns.length - 1) {
+          for (const binding of results) {
+            emit(binding);
+          }
+        }
+      }
+    }, getOperationVariables(new AlgebraFactory(<RDF.DataFactory> <unknown> this.dataFactory).createBgp(patterns)));
   }
 
   // Fetch a WiseKG plan for a BGP and execute it.
@@ -711,7 +768,7 @@ export class QuerySourceWiseKg implements IQuerySource {
         const indexBody = ActorHttp.toNodeReadable(indexResponse.body);
         const indexPayload = await readStreamToBuffer(indexBody);
         if (indexPayload.length > 0) {
-          writeFileSync(`${partitionPath}.index.v1-1`, indexPayload);
+          writeFileSync(`${partitionPath}.index.v1-1`, <any> indexPayload);
         }
       }
     }
@@ -721,21 +778,21 @@ export class QuerySourceWiseKg implements IQuerySource {
   // Persist a partition payload, extracting HDT files from tar payloads when needed.
   private writePartitionPayload(partitionPath: string, payload: Buffer): void {
     if (isHdtBuffer(payload)) {
-      writeFileSync(partitionPath, payload);
+      writeFileSync(partitionPath, <any> payload);
       return;
     }
 
     const entries = extractTarEntries(payload);
     const hdtEntry = entries.find(entry => entry.name.endsWith('.hdt') && !entry.name.endsWith('.index.v1-1'));
     if (!hdtEntry) {
-      writeFileSync(partitionPath, payload);
+      writeFileSync(partitionPath, <any> payload);
       return;
     }
 
-    writeFileSync(partitionPath, hdtEntry.payload);
+    writeFileSync(partitionPath, <any> hdtEntry.payload);
     const indexEntry = entries.find(entry => entry.name === `${hdtEntry.name}.index.v1-1`);
     if (indexEntry && indexEntry.payload.length > 0) {
-      writeFileSync(`${partitionPath}.index.v1-1`, indexEntry.payload);
+      writeFileSync(`${partitionPath}.index.v1-1`, <any> indexEntry.payload);
     }
   }
 
@@ -815,6 +872,13 @@ export class QuerySourceWiseKg implements IQuerySource {
     }
     const promise = this.collectHdtBindings(document, pattern);
     this.hdtPatternCache.set(cacheKey, promise);
+    while (this.hdtPatternCache.size > 8) {
+      const oldestKey = this.hdtPatternCache.keys().next().value;
+      if (oldestKey === undefined) {
+        break;
+      }
+      this.hdtPatternCache.delete(oldestKey);
+    }
     return promise;
   }
 
@@ -1661,7 +1725,7 @@ async function readStreamToString(stream: NodeJS.ReadableStream): Promise<string
   for await (const chunk of <AsyncIterable<Uint8Array | string>> <any> stream) {
     content += typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true });
   }
-  return content + decoder.decode();
+  return content + decoder.decode(<any> undefined);
 }
 
 // Collect a readable stream into a Buffer.
@@ -1670,7 +1734,7 @@ async function readStreamToBuffer(stream: NodeJS.ReadableStream): Promise<Buffer
   for await (const chunk of <AsyncIterable<Uint8Array | string>> <any> stream) {
     chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : Buffer.from(chunk));
   }
-  return Buffer.concat(chunks);
+  return Buffer.concat(<any> chunks);
 }
 
 // Check whether a payload starts with the HDT magic header.
@@ -1686,7 +1750,7 @@ function isHdtFile(path: string): boolean {
   const fd = openSync(path, 'r');
   try {
     const header = Buffer.allocUnsafe(4);
-    return readSync(fd, header, 0, 4, 0) === 4 && isHdtBuffer(header);
+    return readSync(fd, <any> header, 0, 4, 0) === 4 && isHdtBuffer(header);
   } finally {
     closeSync(fd);
   }

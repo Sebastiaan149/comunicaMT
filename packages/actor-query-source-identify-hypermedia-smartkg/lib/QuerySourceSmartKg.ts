@@ -82,6 +82,7 @@ function createMetadataValidationState(): MetadataBindings['state'] {
 class HdtDocumentCache {
   private readonly cache = new Map<string, Promise<HdtDocument>>();
   private opening: Promise<void> = Promise.resolve();
+  private static readonly maxDocuments = 4;
 
   public async getDocument(path: string): Promise<HdtDocument> {
     const existing = this.cache.get(path);
@@ -92,6 +93,13 @@ class HdtDocumentCache {
     const documentPromise = this.opening.then(async() => (await loadHdtModule()).fromFile(path));
     this.opening = documentPromise.then(() => {}, () => {});
     this.cache.set(path, documentPromise);
+    while (this.cache.size > HdtDocumentCache.maxDocuments) {
+      const oldestPath = this.cache.keys().next().value;
+      if (oldestPath === undefined) {
+        break;
+      }
+      this.cache.delete(oldestPath);
+    }
     return documentPromise;
   }
 
@@ -197,8 +205,12 @@ export class QuerySourceSmartKg implements IQuerySource {
     mediatorQuerySourceDereferenceLink?: any,
   ) {
     const normalizedUrl = normalizeUrl(url);
-    const datasetName = normalizedUrl.split('/').filter(Boolean).pop() ?? 'smartkg';
-    const origin = normalizedUrl.replace(/\/$/u, '').replace(/\/[^/]+$/u, '');
+    const sourceLocation = new URL(normalizedUrl);
+    const datasetName = sourceLocation.pathname.split('/').filter(Boolean).at(-1);
+    if (!datasetName) {
+      throw new Error(`SmartKG source URL must identify a dataset path: ${url}`);
+    }
+    const origin = sourceLocation.origin;
 
     this.referenceValue = normalizedUrl;
     this.originalSourceUrl = normalizedUrl;
@@ -403,13 +415,6 @@ export class QuerySourceSmartKg implements IQuerySource {
   ): Promise<RDF.Bindings[]> {
     const usePartitions = await this.shouldUsePartitions(pattern, context);
     if (usePartitions) {
-      if (this.smartKgPlusSource) {
-        const [ partitionResults, sourceResults ] = await Promise.all([
-          this.queryPatternsViaPartitions([ pattern ], context, options),
-          this.queryFallbackBindings(pattern, context, options).then(stream => this.collectBindingsFromStream(stream)),
-        ]);
-        return deduplicateBindings([ ...partitionResults, ...sourceResults ]);
-      }
       const partitionResults = await this.queryPatternsViaPartitions([ pattern ], context, options);
       if (partitionResults.length > 0) {
         return partitionResults;
@@ -425,14 +430,10 @@ export class QuerySourceSmartKg implements IQuerySource {
   ): Promise<RDF.Bindings[]> {
     const metadata = await this.fetchMetadata();
     if (patterns.length >= 2 && isStarEligibleForPartitions(patterns, metadata)) {
-      if (this.smartKgPlusSource) {
-        const [ partitionResults, sourceResults ] = await Promise.all([
-          this.queryPatternsViaPartitions(patterns, context, options),
-          this.queryPatternsViaOriginalSource(patterns, context, options),
-        ]);
-        return deduplicateBindings([ ...partitionResults, ...sourceResults ]);
+      const partitionResults = await this.queryPatternsViaPartitions(patterns, context, options);
+      if (partitionResults.length > 0) {
+        return partitionResults;
       }
-      return this.queryPatternsViaPartitions(patterns, context, options);
     }
 
     return this.queryPatternsViaOriginalSource(patterns, context, options);
@@ -443,7 +444,10 @@ export class QuerySourceSmartKg implements IQuerySource {
     context: IActionContext,
     options?: IQueryBindingsOptions,
   ): Promise<RDF.Bindings[]> {
-    const orderedPatterns = this.smartKgPlusSource ?
+    // Typed planning is beneficial only when rdf:type is concretely bound. For
+    // an unbound type it merely adds cardinality requests without reducing the
+    // typed-family search space, so retain the original streaming order.
+    const orderedPatterns = this.smartKgPlusSource && hasConcreteTypeConstraint(patterns) ?
       await this.sortPatternsByOriginalSourceCardinality(patterns, context) :
       patterns;
     let results: RDF.Bindings[] = [ await this.emptyBinding() ];
@@ -540,7 +544,9 @@ export class QuerySourceSmartKg implements IQuerySource {
       return [];
     }
 
-    const candidateFamilies = selectCompatibleStarFamilies(patterns, metadata);
+    const candidateFamilies = this.smartKgPlusSource ?
+      selectCompatibleTypedStarFamilies(patterns, metadata) :
+      selectCompatibleStarFamilies(patterns, metadata);
     if (candidateFamilies.length === 0) {
       return this.queryPatternsViaAllPartitionFamilies(patterns, metadata);
     }
@@ -550,7 +556,8 @@ export class QuerySourceSmartKg implements IQuerySource {
       return this.queryPatternsViaAllPartitionFamilies(patterns, metadata);
     }
 
-    if (!this.smartKgPlusSource && await this.shouldPreferOriginalSourceStar(patterns, scopedFamilies, context)) {
+    if ((!this.smartKgPlusSource || !hasConcreteTypeConstraint(patterns)) &&
+      await this.shouldPreferOriginalSourceStar(patterns, scopedFamilies, context)) {
       return this.queryPatternsViaOriginalSource(patterns, context, options);
     }
 
@@ -795,6 +802,13 @@ export class QuerySourceSmartKg implements IQuerySource {
     }
     const promise = this.collectHdtBindings(document, pattern);
     this.hdtPatternCache.set(cacheKey, promise);
+    while (this.hdtPatternCache.size > 8) {
+      const oldestKey = this.hdtPatternCache.keys().next().value;
+      if (oldestKey === undefined) {
+        break;
+      }
+      this.hdtPatternCache.delete(oldestKey);
+    }
     return promise;
   }
 
@@ -1454,6 +1468,15 @@ function isStarEligibleForPartitions(patterns: Algebra.Pattern[], metadata: ISma
   });
 }
 
+// Typed family partitions only reduce the candidate set when the query fixes a
+// class. A variable rdf:type object must keep the regular family strategy.
+function hasConcreteTypeConstraint(patterns: Algebra.Pattern[]): boolean {
+  return patterns.some(pattern =>
+    pattern.predicate.termType === 'NamedNode' &&
+    pattern.predicate.value === 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' &&
+    pattern.object.termType !== 'Variable');
+}
+
 function selectCompatibleStarFamilies(patterns: Algebra.Pattern[], metadata: ISmartKgMetadata): ISmartKgFamily[] {
   const queryPredicates = extractPredicates(patterns);
   if (queryPredicates.size === 0) {
@@ -1485,6 +1508,20 @@ function selectCompatibleStarFamilies(patterns: Algebra.Pattern[], metadata: ISm
   const maximalSubsets = filterMaximalByPredicateSet(properSubsets);
 
   return deduplicateFamilies([ ...minimalSupersets, ...maximalSubsets ]);
+}
+
+function selectCompatibleTypedStarFamilies(patterns: Algebra.Pattern[], metadata: ISmartKgMetadata): ISmartKgFamily[] {
+  const families = selectCompatibleStarFamilies(patterns, metadata);
+  const requiredClasses = patterns
+    .filter(pattern => pattern.predicate.termType === 'NamedNode' &&
+      pattern.predicate.value === 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' &&
+      pattern.object.termType === 'NamedNode')
+    .map(pattern => pattern.object.value);
+  if (requiredClasses.length === 0) {
+    return families;
+  }
+  return families.filter(family =>
+    requiredClasses.every(classIri => family.classesSet?.includes(classIri)));
 }
 
 function sortPatternsByEstimatedPartitionSize(

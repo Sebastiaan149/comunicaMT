@@ -718,11 +718,6 @@ export class QuerySourceSmartKg implements IQuerySource {
       return this.queryPatternsViaAllPartitionFamilies(patterns, metadata);
     }
 
-    if ((!this.smartKgPlusSource || !hasConcreteTypeConstraint(patterns)) &&
-      await this.shouldPreferOriginalSourceStar(patterns, scopedFamilies, context)) {
-      return this.queryPatternsViaOriginalSource(patterns, context, options);
-    }
-
     const orderedPatterns = sortPatternsByEstimatedPartitionSize(patterns, metadata);
     const completeResults = await this.queryPatternsOnMaterializedFamilies(
       orderedPatterns,
@@ -748,41 +743,6 @@ export class QuerySourceSmartKg implements IQuerySource {
     }
 
     return scopedResults;
-  }
-
-  private async shouldPreferOriginalSourceStar(
-    patterns: Algebra.Pattern[],
-    scopedFamilies: { completeFamilies: ISmartKgFamily[]; partialFamilies: ISmartKgFamily[] },
-    context: IActionContext,
-  ): Promise<boolean> {
-    if (!this.mediatorQuerySourceDereferenceLink || patterns.length < 2) {
-      return false;
-    }
-
-    const materializedFamilies = deduplicateFamilies([
-      ...scopedFamilies.completeFamilies,
-      ...scopedFamilies.partialFamilies,
-    ]);
-    if (materializedFamilies.length === 0) {
-      return false;
-    }
-
-    const estimatedPartitionTriples = materializedFamilies
-      .reduce((sum, family) => sum + Math.max(0, family.numTriples || 0), 0);
-    if (estimatedPartitionTriples === 0) {
-      return false;
-    }
-
-    const sourceCardinalities = await Promise.all(patterns.map(pattern =>
-      this.estimateOriginalSourcePatternCardinality(pattern, context)));
-    if (sourceCardinalities.some(cardinality =>
-      !Number.isFinite(cardinality) || cardinality === Number.MAX_SAFE_INTEGER)) {
-      return false;
-    }
-
-    const estimatedSourceWork = sourceCardinalities.reduce((sum, cardinality) => sum + cardinality, 0);
-    const familyOpenPenalty = materializedFamilies.length * Math.max(1, patterns.length);
-    return estimatedSourceWork + familyOpenPenalty < estimatedPartitionTriples;
   }
 
   private async queryPatternsViaAllPartitionFamilies(

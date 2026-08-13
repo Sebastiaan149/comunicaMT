@@ -637,6 +637,10 @@ export class QuerySourceSmartKg implements IQuerySource {
     context: IActionContext,
     options?: IQueryBindingsOptions,
   ): Promise<RDF.Bindings[]> {
+    // Hypermedia fallback sources may only partially implement joinBindings.
+    // Explicitly compatibility-join every bounded response batch: this avoids
+    // duplicated broad fragments without materializing the unrestricted
+    // pattern, which can exceed low-end client memory.
     const results: RDF.Bindings[] = [];
     for (const batch of chunkBindings(inputBindings, 30)) {
       const stream = await this.queryFallbackBindings(
@@ -645,7 +649,8 @@ export class QuerySourceSmartKg implements IQuerySource {
         this.withJoinBindings(options, batch),
         sourceUrl,
       );
-      appendItems(results, await this.collectBindingsFromStream(stream));
+      const patternBindings = await this.collectBindingsFromStream(stream);
+      appendItems(results, await this.joinBindingsLists(batch, patternBindings));
     }
     return deduplicateBindings(results);
   }
@@ -665,7 +670,8 @@ export class QuerySourceSmartKg implements IQuerySource {
         this.withJoinBindings(options, batch),
         sourceUrl,
       );
-      for await (const binding of <AsyncIterable<RDF.Bindings>><unknown> stream) {
+      const patternBindings = await this.collectBindingsFromStream(stream);
+      for (const binding of await this.joinBindingsLists(batch, patternBindings)) {
         await emit(binding);
       }
     }

@@ -608,12 +608,12 @@ export class QuerySourceSmartKg implements IQuerySource {
       const controlPath = new URL(controlUrl).pathname;
       if (controlPath.includes('/molecule/') || controlPath.includes('/partition/')) {
         if (!hasConcreteTypeConstraint(patterns)) {
-          // A typed family is only one disjoint dataset slice. A server plan
-          // may select it as a cheap representative even though the star has
-          // no fixed rdf:type, which makes direct execution incomplete.
-          // Preserve the server's star order but union every compatible typed
-          // family for this step.
-          return this.evaluateSmartKgPlusStarAcrossFamilies(patterns, inputBindings, context, options);
+          // Typed-family metadata only covers the classes represented by the
+          // SmartKG+ partitioning.  For an untyped star, neither the planned
+          // family nor a union of compatible typed families proves complete:
+          // matching subjects may belong to an omitted class.  Preserve the
+          // server's star order, but evaluate this step on the complete index.
+          return this.evaluateSmartKgPlusUntypedStar(patterns, inputBindings, context, options);
         }
         try {
           // Both controls address the exact family selected by the server
@@ -686,40 +686,13 @@ export class QuerySourceSmartKg implements IQuerySource {
     return this.queryPatternsViaSource(patterns, this.originalSourceUrl, context, options, inputBindings);
   }
 
-  private async evaluateSmartKgPlusStarAcrossFamilies(
+  private async evaluateSmartKgPlusUntypedStar(
     patterns: Algebra.Pattern[],
     inputBindings: RDF.Bindings[],
     context: IActionContext,
     options?: IQueryBindingsOptions,
   ): Promise<RDF.Bindings[]> {
-    const metadata = await this.fetchMetadata();
-    if (!isStarEligibleForPartitions(patterns, metadata)) {
-      return this.queryPatternsViaSource(patterns, this.originalSourceUrl, context, options, inputBindings);
-    }
-
-    const compatibleFamilies = selectCompatibleTypedStarFamilies(patterns, metadata);
-    let partitionInput = inputBindings;
-    if (patterns.some(hasConcreteSubjectOrObject)) {
-      const ordered = await this.sortPatternsByOriginalSourceCardinality(patterns, context);
-      partitionInput = await this.querySourcePatternWithInput(
-        ordered[0],
-        inputBindings,
-        this.originalSourceUrl,
-        context,
-        options,
-      );
-      if (partitionInput.length === 0) {
-        return [];
-      }
-    }
-    if (hasOversizedSourceSet(compatibleFamilies)) {
-      return this.queryPatternsViaSource(patterns, this.originalSourceUrl, context, options, partitionInput);
-    }
-
-    const partitionResults = await this.queryPatternsViaPartitions(patterns, context, options, partitionInput);
-    return partitionResults.length > 0 ?
-      partitionResults :
-      this.queryPatternsViaSource(patterns, this.originalSourceUrl, context, options, partitionInput);
+    return this.queryPatternsViaSource(patterns, this.originalSourceUrl, context, options, inputBindings);
   }
 
   private async evaluateSmartKgPlusControlledStar(

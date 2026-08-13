@@ -447,20 +447,15 @@ export class QuerySourceSmartKg implements IQuerySource {
     stars: Algebra.Pattern[][],
     context: IActionContext,
   ): Promise<IStarExecution[]> {
-    if (this.smartKgPlusSource) {
-      const planned = await this.fetchSmartKgPlusStarOrder(stars);
-      if (planned) {
-        return planned;
-      }
-    }
-
     if (stars.length < 2) {
       return stars.map(patterns => ({ patterns }));
     }
 
     // The original SmartKG client planner orders subplans using the smallest
-    // TPF cardinality in every star. This also provides a safe fallback when
-    // a SmartKG+ server can not provide a plan.
+    // TPF cardinality in every star. SmartKG+ deliberately uses the same
+    // connected ordering: its server plan controls can choose an incomplete
+    // typed family and generate enormous intermediates. This changes only the
+    // smartkg+ route; the regular SmartKG branch already used this planner.
     const estimated = await Promise.all(stars.map(async star => ({
       star,
       cardinality: Math.min(...await Promise.all(

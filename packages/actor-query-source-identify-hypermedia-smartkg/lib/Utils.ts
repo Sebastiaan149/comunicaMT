@@ -11,7 +11,8 @@ export interface ISmartKgFamily {
   predicateSet: string[];
   classesSet?: string[];
   sourceSet?: number[];
-  originalFamily?: number;
+  // Grouped families may represent a union of sourceSet plus their own HDT.
+  originalFamily?: boolean;
   noMaterialized?: boolean;
 }
 
@@ -105,29 +106,25 @@ export function resolveFamiliesToMaterialized(
     }
 
     visiting.add(family.index);
+    // SourceSet is the collection represented by a grouped family. When
+    // originalFamily is true, the grouped family also has a materialized HDT
+    // containing an additional disjoint portion and must be included as well.
     if (Array.isArray(family.sourceSet) && family.sourceSet.length > 0) {
-      for (const index of family.sourceSet) {
+      for (const index of new Set(family.sourceSet)) {
         const sourceFamily = byIndex.get(index);
         if (sourceFamily) {
           visit(sourceFamily);
         }
       }
-      visiting.delete(family.index);
-      return;
-    }
-
-    const isMaterialized = !family.noMaterialized && family.numTriples > 0 && Boolean(family.name);
-    if (isMaterialized) {
-      resolved.set(family.index, family);
-      visiting.delete(family.index);
-      return;
-    }
-
-    if (typeof family.originalFamily === 'number') {
-      const original = byIndex.get(family.originalFamily);
-      if (original) {
-        visit(original);
+      if (family.originalFamily && !family.noMaterialized && family.numTriples > 0 && family.name) {
+        resolved.set(family.index, family);
       }
+      visiting.delete(family.index);
+      return;
+    }
+
+    if (!family.noMaterialized && family.numTriples > 0 && family.name) {
+      resolved.set(family.index, family);
     }
     visiting.delete(family.index);
   };
@@ -222,7 +219,7 @@ export function parseSmartKgMetadata(jsonStr: string): ISmartKgMetadata {
       sourceSet: Array.isArray(family.sourceSet) ?
         family.sourceSet.filter((value: unknown) => typeof value === 'number') :
         undefined,
-      originalFamily: typeof family.originalFamily === 'number' ? family.originalFamily : undefined,
+      originalFamily: typeof family.originalFamily === 'boolean' ? family.originalFamily : undefined,
       noMaterialized: Boolean(family.noMaterialized),
     })),
   };

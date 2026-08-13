@@ -764,7 +764,7 @@ class SpfBindingsIterator extends BufferedIterator<RDF.Bindings> {
 }
 
 // Match all quads in an SPF page against the requested subject star.
-function matchStarResponse(
+export function matchStarResponse(
   star: ISpfStar,
   quads: RDF.Quad[],
   bindingsFactory: BindingsFactory,

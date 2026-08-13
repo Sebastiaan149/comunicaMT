@@ -13,11 +13,7 @@ import {
 } from 'node:fs';
 import { basename, isAbsolute, join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
-import {
-  createSpfRequestUrl,
-  createSpfSearchForm,
-  matchStarResponse,
-} from '@comunica/actor-query-source-identify-hypermedia-spf';
+import { matchStarResponse } from '@comunica/actor-query-source-identify-hypermedia-spf';
 import type { ISpfStar } from '@comunica/actor-query-source-identify-hypermedia-spf';
 import type { MediatorHttp } from '@comunica/bus-http';
 import { ActorHttp } from '@comunica/bus-http';
@@ -78,8 +74,6 @@ interface IStarExecution {
 }
 const smartKgPlusPlanPromises = new Map<string, Promise<ISmartKgPlusPlanStep[] | undefined>>();
 const HYDRA_NEXT = 'http://www.w3.org/ns/hydra/core#next';
-// The SmartKG+ server accepts at most 30 solution mappings per request.
-const SMARTKG_PLUS_MAPPINGS_PER_REQUEST = 30;
 // Keep bound TPF lookups concurrent enough to hide request latency without
 // retaining more than a small fixed number of fragment pages.
 const TPF_BOUND_REQUEST_CONCURRENCY = 8;
@@ -478,7 +472,7 @@ export class QuerySourceSmartKg implements IQuerySource {
     stars: Algebra.Pattern[][],
     context: IActionContext,
   ): Promise<IStarExecution[]> {
-    if (stars.length < 2) {
+    if (stars.length === 0) {
       return stars.map(patterns => ({ patterns }));
     }
 
@@ -491,6 +485,10 @@ export class QuerySourceSmartKg implements IQuerySource {
       if (serverPlan) {
         return serverPlan;
       }
+    }
+
+    if (stars.length === 1) {
+      return stars.map(patterns => ({ patterns }));
     }
 
     // Original SmartKG orders subplans by their smallest TPF cardinality.
@@ -609,6 +607,14 @@ export class QuerySourceSmartKg implements IQuerySource {
       const controlUrl = this.getSafeSmartKgPlusControlUrl(patterns, control);
       const controlPath = new URL(controlUrl).pathname;
       if (controlPath.includes('/molecule/') || controlPath.includes('/partition/')) {
+        if (!hasConcreteTypeConstraint(patterns)) {
+          // A typed family is only one disjoint dataset slice. A server plan
+          // may select it as a cheap representative even though the star has
+          // no fixed rdf:type, which makes direct execution incomplete.
+          // Preserve the server's star order but union every compatible typed
+          // family for this step.
+          return this.evaluateSmartKgPlusStarAcrossFamilies(patterns, inputBindings, context, options);
+        }
         try {
           // Both controls address the exact family selected by the server
           // plan. Fetch the compact HDT representation for /partition/
@@ -636,14 +642,9 @@ export class QuerySourceSmartKg implements IQuerySource {
           return this.queryPatternsViaSource(patterns, this.originalSourceUrl, context, options, inputBindings);
         }
       }
-      if (patterns.length > 1) {
-        try {
-          return await this.querySpfStarWithInput(patterns, inputBindings, controlUrl, context);
-        } catch {
-          // Older SmartKG+ deployments may not expose SPF on the dataset
-          // control. Retain the server plan and use its brTPF interface.
-        }
-      }
+      // The SmartKG+ SPF representation can split one subject star across
+      // pages and thereby omit combinations. Retain the server-selected full
+      // control and plan order, but execute this step through complete TPF.
       return this.queryPatternsViaSource(patterns, controlUrl, context, options, inputBindings);
     }
 
@@ -685,6 +686,42 @@ export class QuerySourceSmartKg implements IQuerySource {
     return this.queryPatternsViaSource(patterns, this.originalSourceUrl, context, options, inputBindings);
   }
 
+  private async evaluateSmartKgPlusStarAcrossFamilies(
+    patterns: Algebra.Pattern[],
+    inputBindings: RDF.Bindings[],
+    context: IActionContext,
+    options?: IQueryBindingsOptions,
+  ): Promise<RDF.Bindings[]> {
+    const metadata = await this.fetchMetadata();
+    if (!isStarEligibleForPartitions(patterns, metadata)) {
+      return this.queryPatternsViaSource(patterns, this.originalSourceUrl, context, options, inputBindings);
+    }
+
+    const compatibleFamilies = selectCompatibleTypedStarFamilies(patterns, metadata);
+    let partitionInput = inputBindings;
+    if (patterns.some(hasConcreteSubjectOrObject)) {
+      const ordered = await this.sortPatternsByOriginalSourceCardinality(patterns, context);
+      partitionInput = await this.querySourcePatternWithInput(
+        ordered[0],
+        inputBindings,
+        this.originalSourceUrl,
+        context,
+        options,
+      );
+      if (partitionInput.length === 0) {
+        return [];
+      }
+    }
+    if (hasOversizedSourceSet(compatibleFamilies)) {
+      return this.queryPatternsViaSource(patterns, this.originalSourceUrl, context, options, partitionInput);
+    }
+
+    const partitionResults = await this.queryPatternsViaPartitions(patterns, context, options, partitionInput);
+    return partitionResults.length > 0 ?
+      partitionResults :
+      this.queryPatternsViaSource(patterns, this.originalSourceUrl, context, options, partitionInput);
+  }
+
   private async evaluateSmartKgPlusControlledStar(
     patterns: Algebra.Pattern[],
     control: string,
@@ -720,16 +757,6 @@ export class QuerySourceSmartKg implements IQuerySource {
     emit: (binding: RDF.Bindings) => Promise<void>,
   ): Promise<void> {
     const sourceUrl = this.getSafeSmartKgPlusControlUrl(patterns, control);
-    if (patterns.length > 1) {
-      try {
-        for (const binding of await this.querySpfStarWithInput(patterns, inputBindings, sourceUrl, context)) {
-          await emit(binding);
-        }
-        return;
-      } catch {
-        // Fall through to the compatibility path for older servers.
-      }
-    }
     const orderedPatterns = await this.sortPatternsByOriginalSourceCardinality(patterns, context);
     let results = inputBindings;
     for (const [ index, pattern ] of orderedPatterns.entries()) {
@@ -743,68 +770,6 @@ export class QuerySourceSmartKg implements IQuerySource {
         return;
       }
     }
-  }
-
-  /**
-   * Execute a full-control SmartKG+ plan step as one bounded SPF star request.
-   * Pages are parsed and joined immediately, so neither the dataset nor all
-   * server responses are retained in one array.
-   */
-  private async querySpfStarWithInput(
-    patterns: Algebra.Pattern[],
-    inputBindings: RDF.Bindings[],
-    sourceUrl: string,
-    context: IActionContext,
-  ): Promise<RDF.Bindings[]> {
-    const control = createSpfSearchForm(sourceUrl);
-    const star: ISpfStar = { subject: patterns[0].subject, patterns };
-    const groups = groupBindingsForPatterns(inputBindings, patterns);
-    const bindingsFactory = await this.getBindingsFactory();
-    const results: RDF.Bindings[] = [];
-
-    for (let offset = 0; offset < groups.length; offset += SMARTKG_PLUS_MAPPINGS_PER_REQUEST) {
-      const chunkGroups = groups.slice(offset, offset + SMARTKG_PLUS_MAPPINGS_PER_REQUEST);
-      const requestBindings = chunkGroups.map(group => group[0]);
-      const sourceBindings = chunkGroups.flat();
-      let pageUrl: string | undefined;
-
-      do {
-        const requestUrl = createSpfRequestUrl(
-          control,
-          star,
-          requestBindings,
-          SMARTKG_PLUS_MAPPINGS_PER_REQUEST,
-          pageUrl,
-        );
-        const response = await this.mediatorHttp.mediate({
-          context,
-          input: requestUrl,
-          init: { headers: { accept: 'text/turtle' }},
-        });
-        if (!response.ok) {
-          throw new Error(`SmartKG+ SPF request failed with HTTP ${response.status}.`);
-        }
-
-        const contentType = response.headers.get('content-type')?.split(';', 1)[0] ?? 'text/turtle';
-        const quadStream = rdfParser.parse(ActorHttp.toNodeReadable(response.body), {
-          baseIRI: requestUrl,
-          contentType,
-        });
-        const pageQuads: RDF.Quad[] = [];
-        pageUrl = undefined;
-        for await (const quad of <AsyncIterable<RDF.Quad>><unknown> quadStream) {
-          if (quad.predicate.value === HYDRA_NEXT && quad.object.termType === 'NamedNode') {
-            pageUrl = rebaseControlUrl(quad.object.value, sourceUrl);
-          }
-          pageQuads.push(quad);
-        }
-
-        const pageBindings = matchStarResponse(star, pageQuads, bindingsFactory);
-        appendItems(results, await this.joinBindingsLists(sourceBindings, pageBindings));
-      } while (pageUrl);
-    }
-
-    return results;
   }
 
   private async queryPatternsViaSource(
@@ -1842,16 +1807,6 @@ function groupBindingsForPattern(bindings: RDF.Bindings[], pattern: Algebra.Patt
   return groupBindingsForVariables(bindings, getPatternVariableNames(pattern));
 }
 
-function groupBindingsForPatterns(bindings: RDF.Bindings[], patterns: Algebra.Pattern[]): RDF.Bindings[][] {
-  const variables = new Set<string>();
-  for (const pattern of patterns) {
-    for (const variable of getPatternVariableNames(pattern)) {
-      variables.add(variable);
-    }
-  }
-  return groupBindingsForVariables(bindings, [ ...variables ]);
-}
-
 function groupBindingsForVariables(bindings: RDF.Bindings[], variables: string[]): RDF.Bindings[][] {
   const patternVariables = variables;
   const relevantVariables = patternVariables.filter(variable =>
@@ -2124,6 +2079,13 @@ function getStarVariableNames(patterns: Algebra.Pattern[]): Set<string> {
 
 function hasConcreteSubjectOrObject(pattern: Algebra.Pattern): boolean {
   return pattern.subject.termType !== 'Variable' || pattern.object.termType !== 'Variable';
+}
+
+function hasConcreteTypeConstraint(patterns: Algebra.Pattern[]): boolean {
+  return patterns.some(pattern =>
+    pattern.predicate.termType === 'NamedNode' &&
+    pattern.predicate.value === 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' &&
+    pattern.object.termType === 'NamedNode');
 }
 
 function bindPatternFromRecord(

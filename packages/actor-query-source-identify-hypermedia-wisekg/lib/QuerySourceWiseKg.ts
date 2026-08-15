@@ -56,6 +56,9 @@ const EARLY_PLAN_INPUT_LIMIT = 128;
 const EARLY_PLAN_OUTPUT_LIMIT = 4;
 const TPF_BOUND_REQUEST_CONCURRENCY = 8;
 const TPF_PIPELINE_BATCH_SIZE = 64;
+const TPF_PIPELINE_STEADY_BATCH_SIZE = 2_048;
+const BOUND_PATTERN_CACHE_SIZE = 1_024;
+const BOUND_PATTERN_CACHE_MAX_RESULTS = 256;
 type HdtDocument = {
   searchBindings: (
     bindingsFactory: BindingsFactory,
@@ -257,6 +260,7 @@ export class QuerySourceWiseKg implements IQuerySource {
   private readonly patternCardinalityCache = new Map<string, number>();
   private readonly planCache = new Map<string, IWiseKgFetchedPlan>();
   private readonly hdtPatternCache = new Map<string, Promise<RDF.Bindings[]>>();
+  private readonly boundPatternCache = new Map<string, Promise<RDF.Bindings[]>>();
   private bindingsFactory: BindingsFactory | undefined;
 
   public constructor(
@@ -760,7 +764,11 @@ export class QuerySourceWiseKg implements IQuerySource {
     };
 
     if (step.control === 'tpf') {
-      await this.streamPatternsViaTpf(starPatterns, inputBindings, context, options, emitOnce);
+      // A single TPF pipeline produces every solution once for an HDT-backed
+      // dataset. Do not retain an output-sized Set merely to deduplicate it:
+      // C3 already has 400K answers at 10M and this must remain viable at
+      // 100M+ scale.
+      await this.streamPatternsViaTpf(starPatterns, inputBindings, context, options, emit);
       return;
     }
 
@@ -916,9 +924,14 @@ export class QuerySourceWiseKg implements IQuerySource {
   ): Promise<void> {
     const ordered = (await Promise.all(patterns.map(async pattern => ({
       pattern,
+      connected: this.countBoundTerms(pattern, inputBindings) > 0,
       cardinality: await this.estimateOriginalSourcePatternCardinality(pattern, context),
     }))))
-      .sort((left, right) => left.cardinality - right.cardinality)
+      // A pattern connected to incoming bindings must be the anchor even when
+      // an unrelated predicate has a smaller global cardinality. Otherwise a
+      // selective F3-style join degenerates into a complete predicate scan.
+      .sort((left, right) => Number(right.connected) - Number(left.connected) ||
+        left.cardinality - right.cardinality)
       .map(entry => entry.pattern);
 
     const evaluate = async(index: number, bindings: RDF.Bindings[]): Promise<void> => {
@@ -943,9 +956,42 @@ export class QuerySourceWiseKg implements IQuerySource {
       }
     };
 
-    if (ordered.length > 0) {
-      await evaluate(0, inputBindings);
+    if (ordered.length === 0) {
+      return;
     }
+
+    // Stream an unbound anchor page-by-page instead of collecting its whole
+    // predicate fragment. Only a fixed-size handoff is retained, after which
+    // later patterns use bounded subject/object lookups.
+    if (inputBindings.length === 1 && inputBindings[0].size === 0) {
+      let anchorBatch: RDF.Bindings[] = [];
+      let anchorBatchSize = TPF_PIPELINE_BATCH_SIZE;
+      await this.streamFallbackBindings(
+        ordered[0],
+        context,
+        options,
+        this.originalSourceUrl,
+        async(binding) => {
+          if (ordered.length === 1) {
+            await emit(binding);
+            return;
+          }
+          anchorBatch.push(binding);
+          if (anchorBatch.length >= anchorBatchSize) {
+            const nextBatch = anchorBatch;
+            anchorBatch = [];
+            anchorBatchSize = TPF_PIPELINE_STEADY_BATCH_SIZE;
+            await evaluate(1, nextBatch);
+          }
+        },
+      );
+      if (anchorBatch.length > 0) {
+        await evaluate(1, anchorBatch);
+      }
+      return;
+    }
+
+    await evaluate(0, inputBindings);
   }
 
   // Download or reuse the local HDT file for a partition control.
@@ -1382,12 +1428,11 @@ export class QuerySourceWiseKg implements IQuerySource {
     context: IActionContext,
     options?: IQueryBindingsOptions,
     sourceUrl = this.originalSourceUrl,
+    allowUnboundScan = true,
   ): Promise<RDF.Bindings[]> {
-    if (inputBindings.length > 0 &&
+    if (allowUnboundScan && inputBindings.length > 0 &&
       await this.shouldUseUnboundLocalJoin([ pattern ], inputBindings, context)) {
-      const stream = await this.queryFallbackBindings(pattern, context, options, sourceUrl);
-      const sourceBindings = await this.collectBindingsFromStream(stream);
-      return this.deduplicateBindings(await this.joinBindingsLists(inputBindings, sourceBindings));
+      return this.queryPatternViaStreamingUnboundJoin(pattern, inputBindings, context, options, sourceUrl);
     }
 
     const grouped = new Map<string, { pattern: Algebra.Pattern; inputBindings: RDF.Bindings[] }>();
@@ -1405,16 +1450,117 @@ export class QuerySourceWiseKg implements IQuerySource {
       const joinedGroups = await Promise.all(groups
         .slice(offset, offset + TPF_BOUND_REQUEST_CONCURRENCY)
         .map(async(group) => {
-          const stream = await this.queryFallbackBindings(group.pattern, context, options, sourceUrl);
-          const bindings = await this.collectBindingsFromStream(stream);
+          const bindings = await this.queryBoundPatternCached(group.pattern, context, options, sourceUrl);
           return this.joinBindingsLists(group.inputBindings, bindings);
         }));
       for (const joined of joinedGroups) {
-        results.push(...joined);
+        for (const binding of joined) {
+          results.push(binding);
+        }
       }
     }
 
     return this.deduplicateBindings(results);
+  }
+
+  // Scan a broad tail fragment once and probe a bounded upstream hash table.
+  // Unlike the previous local-join path, fragment bindings are consumed one
+  // page at a time and never accumulated in a dataset-sized array.
+  private async queryPatternViaStreamingUnboundJoin(
+    pattern: Algebra.Pattern,
+    inputBindings: RDF.Bindings[],
+    context: IActionContext,
+    options: IQueryBindingsOptions | undefined,
+    sourceUrl: string,
+  ): Promise<RDF.Bindings[]> {
+    const inputRecords = inputBindings.map(bindingToRecord);
+    const patternVariables = [ pattern.subject, pattern.predicate, pattern.object ]
+      .filter((term): term is RDF.Variable => term.termType === 'Variable')
+      .map(term => term.value);
+    const sharedVariables = patternVariables.filter(variable =>
+      inputRecords.every(record => record[variable] !== undefined));
+    if (sharedVariables.length === 0) {
+      return this.queryOriginalSourcePatternWithBoundRequests(pattern, inputBindings, context, options, sourceUrl);
+    }
+
+    const index = new Map<string, Record<string, RDF.Term>[]>();
+    for (const record of inputRecords) {
+      const key = joinKey(record, sharedVariables);
+      const bucket = index.get(key);
+      if (bucket) {
+        bucket.push(record);
+      } else {
+        index.set(key, [ record ]);
+      }
+    }
+
+    const bindingsFactory = await this.getBindingsFactory();
+    const results: RDF.Bindings[] = [];
+    await this.streamFallbackBindings(pattern, context, options, sourceUrl, async(binding) => {
+      const sourceRecord = bindingToRecord(binding);
+      const candidates = index.get(joinKey(sourceRecord, sharedVariables));
+      if (candidates) {
+        for (const candidate of candidates) {
+          if (areBindingRecordsCompatible(candidate, sourceRecord)) {
+            results.push(bindingsFactory.fromRecord({ ...candidate, ...sourceRecord }));
+          }
+        }
+      }
+    });
+    return results;
+  }
+
+  private async queryOriginalSourcePatternWithBoundRequests(
+    pattern: Algebra.Pattern,
+    inputBindings: RDF.Bindings[],
+    context: IActionContext,
+    options: IQueryBindingsOptions | undefined,
+    sourceUrl: string,
+  ): Promise<RDF.Bindings[]> {
+    return this.queryOriginalSourcePatternWithBindings(pattern, inputBindings, context, options, sourceUrl, false);
+  }
+
+  // Reuse nearby subject/object lookups across bounded pipeline batches.
+  // Star products often split combinations for one subject over multiple
+  // batches, which otherwise repeats the same HTTP request many times. Both
+  // entry count and per-entry result count are capped, so memory does not grow
+  // with dataset cardinality.
+  private async queryBoundPatternCached(
+    pattern: Algebra.Pattern,
+    context: IActionContext,
+    options: IQueryBindingsOptions | undefined,
+    sourceUrl: string,
+  ): Promise<RDF.Bindings[]> {
+    const key = `${sourceUrl}|${patternKey(pattern)}`;
+    const cached = this.boundPatternCache.get(key);
+    if (cached) {
+      this.boundPatternCache.delete(key);
+      this.boundPatternCache.set(key, cached);
+      return cached;
+    }
+
+    const promise = (async(): Promise<RDF.Bindings[]> => {
+      const stream = await this.queryFallbackBindings(pattern, context, options, sourceUrl);
+      return this.collectBindingsFromStream(stream);
+    })();
+    this.boundPatternCache.set(key, promise);
+    while (this.boundPatternCache.size > BOUND_PATTERN_CACHE_SIZE) {
+      const oldestKey = this.boundPatternCache.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.boundPatternCache.delete(oldestKey);
+      }
+    }
+
+    try {
+      const bindings = await promise;
+      if (bindings.length > BOUND_PATTERN_CACHE_MAX_RESULTS) {
+        this.boundPatternCache.delete(key);
+      }
+      return bindings;
+    } catch (error) {
+      this.boundPatternCache.delete(key);
+      throw error;
+    }
   }
 
   private async queryStarViaControlledSource(
@@ -1619,15 +1765,30 @@ export class QuerySourceWiseKg implements IQuerySource {
     options?: IQueryBindingsOptions,
     sourceUrl = this.originalSourceUrl,
   ): Promise<RDF.Bindings[]> {
+    const results: RDF.Bindings[] = [];
+    await this.streamFallbackBindings(operation, context, options, sourceUrl, async(binding) => {
+      results.push(binding);
+    });
+    return this.deduplicateBindings(results);
+  }
+
+  // Traverse fallback pages while retaining at most one fragment page. This
+  // is the bounded counterpart of collectFallbackBindings for broad anchors.
+  private async streamFallbackBindings(
+    operation: Algebra.Operation,
+    context: IActionContext,
+    options: IQueryBindingsOptions | undefined,
+    sourceUrl: string,
+    emit: (binding: RDF.Bindings) => Promise<void>,
+  ): Promise<void> {
     if (!this.mediatorQuerySourceDereferenceLink) {
-      return [];
+      return;
     }
 
     const fallbackContext = setContextFlag(context, KEY_CONTEXT_WISEKG_FALLBACK, true);
     const handledDatasets: Record<string, boolean> = {};
     const queuedLinks: string[] = [ sourceUrl ];
     const seenLinks = new Set<string>();
-    const results: RDF.Bindings[] = [];
 
     while (queuedLinks.length > 0) {
       const nextUrl = queuedLinks.shift()!;
@@ -1648,7 +1809,9 @@ export class QuerySourceWiseKg implements IQuerySource {
 
       const stream = source.queryBindings(operation, fallbackContext, options);
       const { bindings, metadata } = await this.collectBindingsAndMetadata(stream);
-      results.push(...bindings);
+      for (const binding of bindings) {
+        await emit(binding);
+      }
 
       const streamNextLinks = getMetadataNextLinks(metadata);
       const nextLinks = streamNextLinks.length > 0 ?
@@ -1660,8 +1823,6 @@ export class QuerySourceWiseKg implements IQuerySource {
         }
       }
     }
-
-    return this.deduplicateBindings(results);
   }
 
   // Lazily create the bindings factory used for local joins.

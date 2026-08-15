@@ -52,6 +52,8 @@ const PARTITION_PLAN_PIPELINE_BATCH_SIZE = 2_048;
 // Without this, broad 10M+ intermediates trigger thousands of sequential
 // downstream star evaluations after producing an early first binding.
 const PLAN_PIPELINE_STEADY_BATCH_SIZE = 32_768;
+const EARLY_PLAN_INPUT_LIMIT = 128;
+const EARLY_PLAN_OUTPUT_LIMIT = 4;
 const TPF_BOUND_REQUEST_CONCURRENCY = 8;
 const TPF_PIPELINE_BATCH_SIZE = 64;
 type HdtDocument = {
@@ -580,14 +582,77 @@ export class QuerySourceWiseKg implements IQuerySource {
       }
     }
 
+    const earlyBindings = await this.emitEarlyPlanResults(steps, context, options, emit);
+    const emitRemaining = async(binding: RDF.Bindings): Promise<void> => {
+      if (!earlyBindings.delete(bindingKey(binding))) {
+        await emit(binding);
+      }
+    };
     await this.streamWiseKgPlanSteps(
       steps,
       0,
       [ await this.emptyBinding() ],
       context,
       options,
-      emit,
+      emitRemaining,
     );
+  }
+
+  // Produce a few valid answers without waiting for the complete first plan
+  // star. The normal executor still runs afterwards and remains responsible
+  // for completeness; emitted early bindings are suppressed once there.
+  private async emitEarlyPlanResults(
+    steps: IWiseKgExecutableStep[],
+    context: IActionContext,
+    options: IQueryBindingsOptions | undefined,
+    emit: (binding: RDF.Bindings) => Promise<void>,
+  ): Promise<Set<string>> {
+    const emitted = new Set<string>();
+    const firstStep = steps[0];
+    if (!firstStep || steps.length < 2 ||
+      this.resolveControlUrl(firstStep.control) !== this.originalSourceUrl) {
+      return emitted;
+    }
+
+    try {
+      const firstPatterns = this.wiseKgStarToPatterns(firstStep.star);
+      const firstStream = await this.queryServerStarBindings(
+        firstPatterns,
+        [ await this.emptyBinding() ],
+        firstStep.control,
+        context,
+        options,
+      );
+      let results: RDF.Bindings[] = [];
+      for await (const binding of <AsyncIterable<RDF.Bindings>> <any> firstStream) {
+        results.push(binding);
+        if (results.length >= EARLY_PLAN_INPUT_LIMIT) {
+          firstStream.destroy();
+          break;
+        }
+      }
+
+      for (const step of steps.slice(1)) {
+        if (results.length === 0) {
+          return emitted;
+        }
+        results = await this.evaluateWiseKgStep(
+          step,
+          this.wiseKgStarToPatterns(step.star),
+          results,
+          context,
+          options,
+        );
+      }
+
+      for (const binding of results.slice(0, EARLY_PLAN_OUTPUT_LIMIT)) {
+        emitted.add(bindingKey(binding));
+        await emit(binding);
+      }
+    } catch (error) {
+      this.logDebug(context, 'WiseKG early-result lane failed; continuing with complete execution.', { error });
+    }
+    return emitted;
   }
 
   // Pipe intermediate plan bindings forward in bounded batches. This keeps
@@ -710,6 +775,41 @@ export class QuerySourceWiseKg implements IQuerySource {
     }
 
     if (this.isServerSourceControl(step.control)) {
+      const sourceUrl = this.resolveControlUrl(step.control);
+      if (sourceUrl === this.originalSourceUrl) {
+        if (inputBindings.length === 1 && inputBindings[0].size === 0) {
+          // SPF is still the efficient representation for an unbound anchor
+          // star: the server can intersect its patterns directly. The paging
+          // defect only appears once join bindings are supplied.
+          const stream = await this.queryServerStarBindings(
+            starPatterns,
+            inputBindings,
+            step.control,
+            context,
+            options,
+          );
+          for await (const binding of <AsyncIterable<RDF.Bindings>> <any> stream) {
+            await emitOnce(binding);
+          }
+          return;
+        }
+
+        // The WiseKG/SPF representation paginates a binding-restricted star
+        // as if it were unbound on 10M+ datasets. One input can consequently
+        // crawl hundreds of full predicate pages. Keep the server-provided
+        // star order, but evaluate root controls through complete TPF lookups,
+        // as SmartKG+ does for its root-controlled plan steps.
+        for (const binding of await this.queryStarViaOriginalSourceWithRetry(
+          starPatterns,
+          context,
+          options,
+          inputBindings,
+        )) {
+          await emit(binding);
+        }
+        return;
+      }
+
       if (this.isServerPartitionControl(step.control)) {
         const stream = await this.queryServerStarBindings(
           starPatterns,
@@ -1121,6 +1221,16 @@ export class QuerySourceWiseKg implements IQuerySource {
       return undefined;
     }
 
+    // A concrete term is a selective anchor. Scanning every other predicate
+    // unbound can turn a handful of indexed lookups into millions of triples
+    // (notably F1-F3 at 10M). Let the adaptive bound pipeline start at that
+    // anchor instead. The all-variable C3-style stars still use the one-scan
+    // local join path to avoid tens of thousands of HTTP lookups.
+    if (patterns.some(pattern =>
+      pattern.subject.termType !== 'Variable' || pattern.object.termType !== 'Variable')) {
+      return undefined;
+    }
+
     const estimated = await Promise.all(patterns.map(async pattern => ({
       pattern,
       cardinality: await this.estimateOriginalSourcePatternCardinality(pattern, context),
@@ -1273,6 +1383,13 @@ export class QuerySourceWiseKg implements IQuerySource {
     options?: IQueryBindingsOptions,
     sourceUrl = this.originalSourceUrl,
   ): Promise<RDF.Bindings[]> {
+    if (inputBindings.length > 0 &&
+      await this.shouldUseUnboundLocalJoin([ pattern ], inputBindings, context)) {
+      const stream = await this.queryFallbackBindings(pattern, context, options, sourceUrl);
+      const sourceBindings = await this.collectBindingsFromStream(stream);
+      return this.deduplicateBindings(await this.joinBindingsLists(inputBindings, sourceBindings));
+    }
+
     const grouped = new Map<string, { pattern: Algebra.Pattern; inputBindings: RDF.Bindings[] }>();
     for (const inputBinding of inputBindings) {
       const boundPattern = this.bindPattern(pattern, inputBinding);
@@ -1308,13 +1425,8 @@ export class QuerySourceWiseKg implements IQuerySource {
     options?: IQueryBindingsOptions,
   ): Promise<RDF.Bindings[]> {
     const sourceUrl = this.resolveControlUrl(control);
-    if (sourceUrl === this.originalSourceUrl &&
-      await this.shouldUseUnboundLocalJoin(patterns, inputBindings, context)) {
-      // Binding-restricted requests are counterproductive when a later plan
-      // step costs less to scan once than to look up for every distinct input.
-      // Fetch that fragment once and perform the indexed join locally.
-      const sourceResults = await this.queryStarViaOriginalSourceWithRetry(patterns, context, options);
-      return this.deduplicateBindings(await this.joinBindingsLists(inputBindings, sourceResults));
+    if (sourceUrl === this.originalSourceUrl) {
+      return this.queryStarViaOriginalSourceWithRetry(patterns, context, options, inputBindings);
     }
 
     // A WiseKG server-side control denotes SPF evaluation, both for the

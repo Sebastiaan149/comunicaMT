@@ -115,6 +115,7 @@ function createMetadataValidationState(): MetadataBindings['state'] {
 
 class HdtDocumentCache {
   private readonly cache = new Map<string, Promise<HdtDocument>>();
+  private readonly active = new Map<string, number>();
   private opening: Promise<void> = Promise.resolve();
   // Native HDT documents map data and indexes outside the V8 heap. Keeping
   // several large partitions open made the client retain many gigabytes even
@@ -122,21 +123,50 @@ class HdtDocumentCache {
   // join while keeping memory bounded on mobile-class clients.
   private static readonly maxDocuments = 2;
 
-  public async getDocument(path: string): Promise<HdtDocument> {
-    const existing = this.cache.get(path);
-    if (existing) {
+  public async acquireDocument(path: string): Promise<{ document: HdtDocument; release: () => Promise<void> }> {
+    let documentPromise = this.cache.get(path);
+    if (documentPromise) {
       // Refresh the insertion order so this map acts as an LRU cache.
       this.cache.delete(path);
-      this.cache.set(path, existing);
-      return existing;
+      this.cache.set(path, documentPromise);
+    } else {
+      // The native HDT index builder is not safe when multiple unindexed partitions are opened concurrently.
+      documentPromise = this.opening.then(async() => (await loadHdtModule()).fromFile(path));
+      this.opening = documentPromise.then(() => {}, () => {});
+      this.cache.set(path, documentPromise);
     }
-    // The native HDT index builder is not safe when multiple unindexed partitions are opened concurrently.
-    const documentPromise = this.opening.then(async() => (await loadHdtModule()).fromFile(path));
-    this.opening = documentPromise.then(() => {}, () => {});
-    this.cache.set(path, documentPromise);
+
+    this.active.set(path, (this.active.get(path) ?? 0) + 1);
+    let released = false;
+    try {
+      const document = await documentPromise;
+      await this.evictInactiveDocuments();
+      return {
+        document,
+        release: async(): Promise<void> => {
+          if (released) {
+            return;
+          }
+          released = true;
+          this.decrementActive(path);
+          await this.evictInactiveDocuments();
+        },
+      };
+    } catch (error) {
+      this.decrementActive(path);
+      if (this.cache.get(path) === documentPromise) {
+        this.cache.delete(path);
+      }
+      throw error;
+    }
+  }
+
+  private async evictInactiveDocuments(): Promise<void> {
     while (this.cache.size > HdtDocumentCache.maxDocuments) {
-      const oldestPath = this.cache.keys().next().value;
+      const oldestPath = [ ...this.cache.keys() ].find(candidate => (this.active.get(candidate) ?? 0) === 0);
       if (oldestPath === undefined) {
+        // Every excess document is part of an active nested streaming scan.
+        // Defer eviction until its lease is released.
         break;
       }
       const evicted = this.cache.get(oldestPath);
@@ -149,12 +179,21 @@ class HdtDocumentCache {
         }
       }
     }
-    return documentPromise;
+  }
+
+  private decrementActive(path: string): void {
+    const count = (this.active.get(path) ?? 1) - 1;
+    if (count <= 0) {
+      this.active.delete(path);
+    } else {
+      this.active.set(path, count);
+    }
   }
 
   public async dispose(): Promise<void> {
     const documents = [ ...this.cache.values() ];
     this.cache.clear();
+    this.active.clear();
     await Promise.all(documents.map(async(document) => {
       try {
         await (await document).close();
@@ -493,7 +532,12 @@ export class QuerySourceSmartKg implements IQuerySource {
       }
       if (!hasConcreteTypeConstraint(patterns)) {
         await this.streamSourceStarWithInput(
-          patterns, inputBindings, this.originalSourceUrl, context, options, emit,
+          patterns,
+          inputBindings,
+          this.originalSourceUrl,
+          context,
+          options,
+          emit,
         );
         return;
       }
@@ -503,7 +547,12 @@ export class QuerySourceSmartKg implements IQuerySource {
     }
     if (!star.control && patterns.length === 1) {
       await this.streamSourcePatternWithInput(
-        patterns[0], inputBindings, this.originalSourceUrl, context, options, emit,
+        patterns[0],
+        inputBindings,
+        this.originalSourceUrl,
+        context,
+        options,
+        emit,
       );
       return;
     }
@@ -562,7 +611,7 @@ export class QuerySourceSmartKg implements IQuerySource {
       return false;
     }
     const scoped = selectStarScopedMaterializedFamilies(patterns, candidateFamilies, metadata);
-    if (scoped.completeFamilies.length !== 1 || scoped.partialFamilies.length !== 0) {
+    if (scoped.completeFamilies.length !== 1 || scoped.partialFamilies.length > 0) {
       return false;
     }
     const family = scoped.completeFamilies[0];
@@ -1332,28 +1381,33 @@ export class QuerySourceSmartKg implements IQuerySource {
     patterns: Algebra.Pattern[],
     inputBindings?: RDF.Bindings[],
   ): Promise<RDF.Bindings[]> {
-    const document = await this.hdtCache.getDocument(partitionPath);
-    if (patterns.length === 0) {
-      return [ await this.emptyBinding() ];
-    }
-    if (patterns.length === 1 && !inputBindings) {
-      return this.collectCachedHdtBindings(partitionPath, document, patterns[0]);
-    }
-
-    // This follows the same cardinality-first, bounded pipeline principles as
-    // Comunica's TPF/brTPF bind joins. Only the smallest HDT pattern is
-    // materialized. Every later pattern is read page-by-page and immediately
-    // hash-joined, avoiding a second full-pattern array and repeated full-array
-    // deduplication at each star step.
-    const orderedPatterns = await this.orderPartitionPatternsByCardinality(document, patterns, inputBindings);
-    let results = inputBindings ?? [ await this.emptyBinding() ];
-    for (const pattern of orderedPatterns) {
-      results = await this.joinBindingsWithHdtPattern(results, document, pattern);
-      if (results.length === 0) {
-        return [];
+    const lease = await this.hdtCache.acquireDocument(partitionPath);
+    const { document } = lease;
+    try {
+      if (patterns.length === 0) {
+        return [ await this.emptyBinding() ];
       }
+      if (patterns.length === 1 && !inputBindings) {
+        return await this.collectCachedHdtBindings(partitionPath, document, patterns[0]);
+      }
+
+      // This follows the same cardinality-first, bounded pipeline principles as
+      // Comunica's TPF/brTPF bind joins. Only the smallest HDT pattern is
+      // materialized. Every later pattern is read page-by-page and immediately
+      // hash-joined, avoiding a second full-pattern array and repeated full-array
+      // deduplication at each star step.
+      const orderedPatterns = await this.orderPartitionPatternsByCardinality(document, patterns, inputBindings);
+      let results = inputBindings ?? [ await this.emptyBinding() ];
+      for (const pattern of orderedPatterns) {
+        results = await this.joinBindingsWithHdtPattern(results, document, pattern);
+        if (results.length === 0) {
+          return [];
+        }
+      }
+      return results;
+    } finally {
+      await lease.release();
     }
-    return results;
   }
 
   private async streamPatternsOnPartition(
@@ -1362,21 +1416,26 @@ export class QuerySourceSmartKg implements IQuerySource {
     inputBindings: RDF.Bindings[],
     emit: (binding: RDF.Bindings) => Promise<void>,
   ): Promise<number> {
-    const document = await this.hdtCache.getDocument(partitionPath);
-    const orderedPatterns = await this.orderPartitionPatternsByCardinality(document, patterns, inputBindings);
-    let results = inputBindings;
-    for (const pattern of orderedPatterns.slice(0, -1)) {
-      results = await this.joinBindingsWithHdtPattern(results, document, pattern);
-      if (results.length === 0) {
-        return 0;
+    const lease = await this.hdtCache.acquireDocument(partitionPath);
+    const { document } = lease;
+    try {
+      const orderedPatterns = await this.orderPartitionPatternsByCardinality(document, patterns, inputBindings);
+      let results = inputBindings;
+      for (const pattern of orderedPatterns.slice(0, -1)) {
+        results = await this.joinBindingsWithHdtPattern(results, document, pattern);
+        if (results.length === 0) {
+          return 0;
+        }
       }
+      let emitted = 0;
+      await this.joinBindingsWithHdtPattern(results, document, orderedPatterns.at(-1)!, async(binding) => {
+        emitted++;
+        await emit(binding);
+      });
+      return emitted;
+    } finally {
+      await lease.release();
     }
-    let emitted = 0;
-    await this.joinBindingsWithHdtPattern(results, document, orderedPatterns.at(-1)!, async(binding) => {
-      emitted++;
-      await emit(binding);
-    });
-    return emitted;
   }
 
   private async orderPartitionPatternsByCardinality(

@@ -73,6 +73,11 @@ interface IStarExecution {
   control?: string;
 }
 const smartKgPlusPlanPromises = new Map<string, Promise<ISmartKgPlusPlanStep[] | undefined>>();
+// Forward intermediate bindings without retaining a complete star result.
+// The fixed bound is independent of dataset cardinality and matches WiseKG's
+// conservative pipeline granularity.
+const STAR_PIPELINE_FIRST_BATCH_SIZE = 256;
+const STAR_PIPELINE_STEADY_BATCH_SIZE = 32_768;
 const HYDRA_NEXT = 'http://www.w3.org/ns/hydra/core#next';
 // Keep bound TPF lookups concurrent enough to hide request latency without
 // retaining more than a small fixed number of fragment pages.
@@ -434,38 +439,144 @@ export class QuerySourceSmartKg implements IQuerySource {
     emit: (binding: RDF.Bindings) => Promise<void>,
   ): Promise<void> {
     const stars = await this.orderStarsForExecution(groupPatternsBySubject(patterns), context);
-    let results: RDF.Bindings[] = [ await this.emptyBinding() ];
+    if (stars.length > 0) {
+      await this.streamStarPipeline(stars, 0, [ await this.emptyBinding() ], context, options, emit);
+    }
+  }
 
-    for (const [ index, star ] of stars.entries()) {
-      const starPatterns = star.patterns;
-      if (this.smartKgPlusSource && index === stars.length - 1 && star.control &&
-        !new URL(star.control, this.originalSourceUrl).pathname.includes('/molecule/') &&
-        !new URL(star.control, this.originalSourceUrl).pathname.includes('/partition/')) {
-        await this.streamSmartKgPlusControlledStar(starPatterns, results, star.control, context, options, emit);
+  private async streamStarPipeline(
+    stars: IStarExecution[],
+    index: number,
+    inputBindings: RDF.Bindings[],
+    context: IActionContext,
+    options: IQueryBindingsOptions | undefined,
+    emit: (binding: RDF.Bindings) => Promise<void>,
+  ): Promise<void> {
+    const star = stars[index];
+    if (!star || inputBindings.length === 0) {
+      return;
+    }
+    if (index === stars.length - 1) {
+      await this.streamStarWithInput(star, inputBindings, context, options, emit);
+      return;
+    }
+
+    let batch: RDF.Bindings[] = [];
+    let batchSize = STAR_PIPELINE_FIRST_BATCH_SIZE;
+    await this.streamStarWithInput(star, inputBindings, context, options, async(binding) => {
+      batch.push(binding);
+      if (batch.length >= batchSize) {
+        const nextBatch = batch;
+        batch = [];
+        await this.streamStarPipeline(stars, index + 1, nextBatch, context, options, emit);
+        batchSize = STAR_PIPELINE_STEADY_BATCH_SIZE;
+      }
+    });
+    if (batch.length > 0) {
+      await this.streamStarPipeline(stars, index + 1, batch, context, options, emit);
+    }
+  }
+
+  private async streamStarWithInput(
+    star: IStarExecution,
+    inputBindings: RDF.Bindings[],
+    context: IActionContext,
+    options: IQueryBindingsOptions | undefined,
+    emit: (binding: RDF.Bindings) => Promise<void>,
+  ): Promise<void> {
+    const patterns = star.patterns;
+    if (this.smartKgPlusSource && star.control) {
+      const controlPath = new URL(star.control, this.originalSourceUrl).pathname;
+      if (!controlPath.includes('/molecule/') && !controlPath.includes('/partition/')) {
+        await this.streamSmartKgPlusControlledStar(patterns, inputBindings, star.control, context, options, emit);
         return;
       }
-      if (index === stars.length - 1 && starPatterns.length === 1 && !star.control) {
-        await this.streamSourcePatternWithInput(
-          starPatterns[0],
-          results,
-          this.originalSourceUrl,
-          context,
-          options,
-          emit,
+      if (!hasConcreteTypeConstraint(patterns)) {
+        await this.streamSourceStarWithInput(
+          patterns, inputBindings, this.originalSourceUrl, context, options, emit,
         );
         return;
       }
-      results = await this.evaluateStarWithInput(starPatterns, results, context, options, star.control);
-      if (results.length === 0) {
-        return;
-      }
-      if (index === stars.length - 1) {
-        for (const binding of results) {
-          await emit(binding);
-        }
+      if (await this.tryStreamControlledPartition(patterns, inputBindings, star.control, emit)) {
         return;
       }
     }
+    if (!star.control && patterns.length === 1) {
+      await this.streamSourcePatternWithInput(
+        patterns[0], inputBindings, this.originalSourceUrl, context, options, emit,
+      );
+      return;
+    }
+    if (!star.control && await this.tryStreamStarViaSinglePartition(patterns, inputBindings, emit)) {
+      return;
+    }
+
+    for (const binding of await this.evaluateStarWithInput(patterns, inputBindings, context, options, star.control)) {
+      await emit(binding);
+    }
+  }
+
+  private async tryStreamControlledPartition(
+    patterns: Algebra.Pattern[],
+    inputBindings: RDF.Bindings[],
+    control: string,
+    emit: (binding: RDF.Bindings) => Promise<void>,
+  ): Promise<boolean> {
+    if (!this.smartKgPlusSource || !hasConcreteTypeConstraint(patterns)) {
+      return false;
+    }
+    const controlUrl = this.getSafeSmartKgPlusControlUrl(patterns, control);
+    const controlPath = new URL(controlUrl).pathname;
+    if (!controlPath.includes('/molecule/') && !controlPath.includes('/partition/')) {
+      return false;
+    }
+    try {
+      const moleculeUrl = controlPath.includes('/partition/') ?
+        controlUrl.replace('/partition/', '/molecule/') :
+        controlUrl;
+      const partitionPath = await this.fetchPartitionFileByUrl(moleculeUrl);
+      return await this.streamPatternsOnPartition(partitionPath, patterns, inputBindings, emit) > 0;
+    } catch {
+      // Virtual or unavailable families keep the existing source-set/TPF
+      // completion path below.
+      return false;
+    }
+  }
+
+  // Stream only the unambiguous single-family case. Multi-family, partial,
+  // oversized, and empty-result cases retain the established completeness
+  // fallbacks in evaluateStarWithInput.
+  private async tryStreamStarViaSinglePartition(
+    patterns: Algebra.Pattern[],
+    inputBindings: RDF.Bindings[],
+    emit: (binding: RDF.Bindings) => Promise<void>,
+  ): Promise<boolean> {
+    const metadata = await this.fetchMetadata();
+    if (patterns.length < 2 || !isStarEligibleForPartitions(patterns, metadata)) {
+      return false;
+    }
+    const candidateFamilies = this.smartKgPlusSource ?
+      selectCompatibleTypedStarFamilies(patterns, metadata) :
+      selectCompatibleStarFamilies(patterns, metadata);
+    if (candidateFamilies.length === 0 || hasOversizedSourceSet(candidateFamilies)) {
+      return false;
+    }
+    const scoped = selectStarScopedMaterializedFamilies(patterns, candidateFamilies, metadata);
+    if (scoped.completeFamilies.length !== 1 || scoped.partialFamilies.length !== 0) {
+      return false;
+    }
+    const family = scoped.completeFamilies[0];
+    if (!family.name || family.numTriples === 0) {
+      return false;
+    }
+    const partitionPath = await this.fetchPartitionFile(family);
+    const emitted = await this.streamPatternsOnPartition(
+      partitionPath,
+      sortPatternsByEstimatedPartitionSize(patterns, metadata),
+      inputBindings,
+      emit,
+    );
+    return emitted > 0;
   }
 
   private async orderStarsForExecution(
@@ -731,10 +842,32 @@ export class QuerySourceSmartKg implements IQuerySource {
   ): Promise<void> {
     const sourceUrl = this.getSafeSmartKgPlusControlUrl(patterns, control);
     const orderedPatterns = await this.sortPatternsByOriginalSourceCardinality(patterns, context);
+    await this.streamOrderedSourceStar(orderedPatterns, inputBindings, sourceUrl, context, options, emit);
+  }
+
+  private async streamSourceStarWithInput(
+    patterns: Algebra.Pattern[],
+    inputBindings: RDF.Bindings[],
+    sourceUrl: string,
+    context: IActionContext,
+    options: IQueryBindingsOptions | undefined,
+    emit: (binding: RDF.Bindings) => Promise<void>,
+  ): Promise<void> {
+    const orderedPatterns = await this.sortPatternsForInput(patterns, inputBindings, context);
+    await this.streamOrderedSourceStar(orderedPatterns, inputBindings, sourceUrl, context, options, emit);
+  }
+
+  private async streamOrderedSourceStar(
+    patterns: Algebra.Pattern[],
+    inputBindings: RDF.Bindings[],
+    sourceUrl: string,
+    context: IActionContext,
+    options: IQueryBindingsOptions | undefined,
+    emit: (binding: RDF.Bindings) => Promise<void>,
+  ): Promise<void> {
     let results = inputBindings;
-    for (const [ index, pattern ] of orderedPatterns.entries()) {
-      const finalPattern = index === orderedPatterns.length - 1;
-      if (finalPattern) {
+    for (const [ index, pattern ] of patterns.entries()) {
+      if (index === patterns.length - 1) {
         await this.streamSourcePatternWithInput(pattern, results, sourceUrl, context, options, emit);
         return;
       }
@@ -1223,6 +1356,29 @@ export class QuerySourceSmartKg implements IQuerySource {
     return results;
   }
 
+  private async streamPatternsOnPartition(
+    partitionPath: string,
+    patterns: Algebra.Pattern[],
+    inputBindings: RDF.Bindings[],
+    emit: (binding: RDF.Bindings) => Promise<void>,
+  ): Promise<number> {
+    const document = await this.hdtCache.getDocument(partitionPath);
+    const orderedPatterns = await this.orderPartitionPatternsByCardinality(document, patterns, inputBindings);
+    let results = inputBindings;
+    for (const pattern of orderedPatterns.slice(0, -1)) {
+      results = await this.joinBindingsWithHdtPattern(results, document, pattern);
+      if (results.length === 0) {
+        return 0;
+      }
+    }
+    let emitted = 0;
+    await this.joinBindingsWithHdtPattern(results, document, orderedPatterns.at(-1)!, async(binding) => {
+      emitted++;
+      await emit(binding);
+    });
+    return emitted;
+  }
+
   private async orderPartitionPatternsByCardinality(
     document: HdtDocument,
     patterns: Algebra.Pattern[],
@@ -1262,6 +1418,7 @@ export class QuerySourceSmartKg implements IQuerySource {
     leftBindings: RDF.Bindings[],
     document: HdtDocument,
     pattern: Algebra.Pattern,
+    emit?: (binding: RDF.Bindings) => Promise<void>,
   ): Promise<RDF.Bindings[]> {
     if (leftBindings.length === 0) {
       return [];
@@ -1297,7 +1454,7 @@ export class QuerySourceSmartKg implements IQuerySource {
         const seen = new Set<string>();
         for (const records of groups.values()) {
           const boundPattern = bindPatternFromRecord(pattern, records[0]);
-          await this.forEachHdtBindingsPage(document, boundPattern, (rightBindings) => {
+          await this.forEachHdtBindingsPage(document, boundPattern, async(rightBindings) => {
             for (const rightBinding of rightBindings) {
               const rightRecord = bindingToRecord(rightBinding);
               for (const leftRecord of records) {
@@ -1308,7 +1465,11 @@ export class QuerySourceSmartKg implements IQuerySource {
                 const key = bindingKey(binding);
                 if (!seen.has(key)) {
                   seen.add(key);
-                  results.push(binding);
+                  if (emit) {
+                    await emit(binding);
+                  } else {
+                    results.push(binding);
+                  }
                 }
               }
             }
@@ -1333,7 +1494,7 @@ export class QuerySourceSmartKg implements IQuerySource {
 
     const results: RDF.Bindings[] = [];
     const seen = new Set<string>();
-    await this.forEachHdtBindingsPage(document, pattern, (rightBindings) => {
+    await this.forEachHdtBindingsPage(document, pattern, async(rightBindings) => {
       for (const rightBinding of rightBindings) {
         const rightRecord = bindingToRecord(rightBinding);
         const candidates = sharedVariables.length > 0 ?
@@ -1347,7 +1508,11 @@ export class QuerySourceSmartKg implements IQuerySource {
           const key = bindingKey(binding);
           if (!seen.has(key)) {
             seen.add(key);
-            results.push(binding);
+            if (emit) {
+              await emit(binding);
+            } else {
+              results.push(binding);
+            }
           }
         }
       }
@@ -1399,7 +1564,7 @@ export class QuerySourceSmartKg implements IQuerySource {
   private async forEachHdtBindingsPage(
     document: HdtDocument,
     pattern: Algebra.Pattern,
-    consume: (bindings: RDF.Bindings[]) => void,
+    consume: (bindings: RDF.Bindings[]) => void | Promise<void>,
   ): Promise<void> {
     const bindingsFactory = await this.getBindingsFactory();
     // Smaller than the old 16K page: this caps transient native/JS objects and
@@ -1416,7 +1581,7 @@ export class QuerySourceSmartKg implements IQuerySource {
         { offset, limit: pageSize },
       );
       const bindings: RDF.Bindings[] = Array.isArray(result?.bindings) ? result.bindings : [];
-      consume(bindings);
+      await consume(bindings);
       if (bindings.length < pageSize) {
         return;
       }

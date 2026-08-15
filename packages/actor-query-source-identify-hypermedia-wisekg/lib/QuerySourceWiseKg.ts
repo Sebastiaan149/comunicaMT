@@ -42,10 +42,6 @@ import {
 
 const DEFAULT_PLAN_SPEED_MBPS = 1;
 const DEFAULT_PLAN_LATENCY_MS = 1_000;
-// Local materialization is only beneficial for genuinely small fragments.
-// Keep this conservative so 100M+ datasets never turn a common-predicate
-// lookup into an unbounded in-memory array.
-const MAX_LOCAL_JOIN_FRAGMENT_BINDINGS = 50_000;
 const PLAN_PIPELINE_BATCH_SIZE = 256;
 // A shipped HDT is scanned for every upstream batch. A somewhat larger, still
 // fixed batch avoids repeating that scan dozens of times for broad first stars
@@ -708,8 +704,7 @@ export class QuerySourceWiseKg implements IQuerySource {
         const partitionUrl = this.getPartitionHdtUrlForControl(control);
         this.logDebug(context, `WiseKG downloading/evaluating partition ${partitionUrl}`);
         const partitionPath = await this.fetchPartitionFileByControl(control);
-        const stepResults = await this.evaluatePatternsOnPartition(partitionPath, starPatterns);
-        await this.emitJoinedBindings(inputBindings, stepResults, emitOnce);
+        await this.streamPatternsOnPartition(partitionPath, starPatterns, inputBindings, emitOnce);
       }
       return;
     }
@@ -984,6 +979,58 @@ export class QuerySourceWiseKg implements IQuerySource {
     }
 
     return this.deduplicateBindings(results);
+  }
+
+  // Evaluate all but the final local pattern eagerly, then page the final HDT
+  // lookup into the join. This mirrors SmartKG+'s first-result path: shipped
+  // partitions remain the complete source of truth, while the client no
+  // longer waits for the complete last HDT scan before exposing one result.
+  private async streamPatternsOnPartition(
+    partitionPath: string,
+    patterns: Algebra.Pattern[],
+    inputBindings: RDF.Bindings[],
+    emit: (binding: RDF.Bindings) => Promise<void>,
+  ): Promise<void> {
+    if (patterns.length === 0 || inputBindings.length === 0) {
+      return;
+    }
+
+    const document = await this.hdtCache.getDocument(partitionPath);
+    // Build the star inside the partition before applying upstream bindings.
+    // Applying them before the star reaches its shared variable can create a
+    // massive temporary Cartesian product (for example, rating bindings only
+    // meet the item star at rev:hasReview).
+    let results: RDF.Bindings[] = [ await this.emptyBinding() ];
+    for (const pattern of patterns.slice(0, -1)) {
+      const bindings = await this.collectCachedHdtBindings(partitionPath, document, pattern);
+      results = this.deduplicateBindings(await this.joinBindingsLists(results, bindings));
+      if (results.length === 0) {
+        return;
+      }
+    }
+
+    const bindingsFactory = await this.getBindingsFactory();
+    const finalPattern = patterns.at(-1)!;
+    const pageSize = 16_384;
+    let offset = 0;
+    while (true) {
+      const result = await document.searchBindings(
+        bindingsFactory,
+        finalPattern.subject,
+        finalPattern.predicate,
+        finalPattern.object,
+        { offset, limit: pageSize },
+      );
+      const page: RDF.Bindings[] = Array.isArray(result?.bindings) ? result.bindings : [];
+      if (page.length > 0) {
+        const partitionPage = await this.joinBindingsLists(results, page);
+        await this.emitJoinedBindings(inputBindings, partitionPage, emit);
+      }
+      if (page.length < pageSize) {
+        return;
+      }
+      offset += page.length;
+    }
   }
 
   // Cache local HDT lookups by partition path and pattern key.
@@ -1264,7 +1311,7 @@ export class QuerySourceWiseKg implements IQuerySource {
     if (sourceUrl === this.originalSourceUrl &&
       await this.shouldUseUnboundLocalJoin(patterns, inputBindings, context)) {
       // Binding-restricted requests are counterproductive when a later plan
-      // step has a small complete fragment but a large incoming multiset.
+      // step costs less to scan once than to look up for every distinct input.
       // Fetch that fragment once and perform the indexed join locally.
       const sourceResults = await this.queryStarViaOriginalSourceWithRetry(patterns, context, options);
       return this.deduplicateBindings(await this.joinBindingsLists(inputBindings, sourceResults));
@@ -1284,13 +1331,36 @@ export class QuerySourceWiseKg implements IQuerySource {
     inputBindings: RDF.Bindings[],
     context: IActionContext,
   ): Promise<boolean> {
-    if (patterns.length !== 1 || inputBindings.length < 50) {
+    if (patterns.length !== 1 || inputBindings.length === 0) {
       return false;
     }
+
+    // Match SmartKG(+)'s request-cost decision. At 10M+ scale a fixed
+    // cardinality ceiling is counterproductive: a common predicate can exceed
+    // that ceiling while one lookup per incoming binding is still an order of
+    // magnitude more expensive than scanning the fragment once and hash
+    // joining it locally. This is especially important for the one-pattern
+    // tail stars in Q1-Q4 and Q6.
+    const pattern = patterns[0];
+    const distinctBoundPatterns = new Set<string>();
+    let subjectBound = false;
+    let objectBound = false;
+    for (const inputBinding of inputBindings) {
+      const boundPattern = this.bindPattern(pattern, inputBinding);
+      distinctBoundPatterns.add(patternKey(boundPattern));
+      subjectBound ||= pattern.subject.termType === 'Variable' &&
+        boundPattern.subject.termType !== 'Variable';
+      objectBound ||= pattern.object.termType === 'Variable' &&
+        boundPattern.object.termType !== 'Variable';
+    }
+
+    if (!subjectBound && !objectBound) {
+      return true;
+    }
+
     const cardinality = await this.estimateOriginalSourcePatternCardinality(patterns[0], context);
-    return Number.isFinite(cardinality) &&
-      cardinality <= MAX_LOCAL_JOIN_FRAGMENT_BINDINGS &&
-      cardinality <= inputBindings.length * 100;
+    const boundLookupCost = distinctBoundPatterns.size * (subjectBound ? 10 : 100);
+    return Number.isFinite(cardinality) && cardinality <= boundLookupCost;
   }
 
   // Complete a planned star through the dataset source. Some generated

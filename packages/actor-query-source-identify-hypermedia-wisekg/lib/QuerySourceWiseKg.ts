@@ -51,6 +51,11 @@ const PLAN_PIPELINE_BATCH_SIZE = 256;
 // fixed batch avoids repeating that scan dozens of times for broad first stars
 // (notably Q1/Q2-shaped plans), without making memory scale with dataset size.
 const PARTITION_PLAN_PIPELINE_BATCH_SIZE = 2_048;
+// Preserve a small first handoff for low latency, then amortize server-side
+// SPF and partition setup across a larger, still dataset-independent batch.
+// Without this, broad 10M+ intermediates trigger thousands of sequential
+// downstream star evaluations after producing an early first binding.
+const PLAN_PIPELINE_STEADY_BATCH_SIZE = 32_768;
 const TPF_BOUND_REQUEST_CONCURRENCY = 8;
 const TPF_PIPELINE_BATCH_SIZE = 64;
 type HdtDocument = {
@@ -611,7 +616,7 @@ export class QuerySourceWiseKg implements IQuerySource {
     }
 
     const nextStep = steps[index + 1];
-    const pipelineBatchSize = nextStep && this.isPartitionShippingControl(nextStep.control) ?
+    let pipelineBatchSize = nextStep && this.isPartitionShippingControl(nextStep.control) ?
       PARTITION_PLAN_PIPELINE_BATCH_SIZE :
       PLAN_PIPELINE_BATCH_SIZE;
     let batch: RDF.Bindings[] = [];
@@ -621,6 +626,7 @@ export class QuerySourceWiseKg implements IQuerySource {
         const nextBatch = batch;
         batch = [];
         await this.streamWiseKgPlanSteps(steps, index + 1, nextBatch, context, options, emit);
+        pipelineBatchSize = PLAN_PIPELINE_STEADY_BATCH_SIZE;
       }
     });
     if (batch.length > 0) {

@@ -47,6 +47,10 @@ const DEFAULT_PLAN_LATENCY_MS = 1_000;
 // lookup into an unbounded in-memory array.
 const MAX_LOCAL_JOIN_FRAGMENT_BINDINGS = 50_000;
 const PLAN_PIPELINE_BATCH_SIZE = 256;
+// A shipped HDT is scanned for every upstream batch. A somewhat larger, still
+// fixed batch avoids repeating that scan dozens of times for broad first stars
+// (notably Q1/Q2-shaped plans), without making memory scale with dataset size.
+const PARTITION_PLAN_PIPELINE_BATCH_SIZE = 2_048;
 const TPF_BOUND_REQUEST_CONCURRENCY = 8;
 const TPF_PIPELINE_BATCH_SIZE = 64;
 type HdtDocument = {
@@ -606,10 +610,14 @@ export class QuerySourceWiseKg implements IQuerySource {
       return;
     }
 
+    const nextStep = steps[index + 1];
+    const pipelineBatchSize = nextStep && this.isPartitionShippingControl(nextStep.control) ?
+      PARTITION_PLAN_PIPELINE_BATCH_SIZE :
+      PLAN_PIPELINE_BATCH_SIZE;
     let batch: RDF.Bindings[] = [];
     await this.streamWiseKgStep(step, starPatterns, inputBindings, context, options, async(binding) => {
       batch.push(binding);
-      if (batch.length >= PLAN_PIPELINE_BATCH_SIZE) {
+      if (batch.length >= pipelineBatchSize) {
         const nextBatch = batch;
         batch = [];
         await this.streamWiseKgPlanSteps(steps, index + 1, nextBatch, context, options, emit);

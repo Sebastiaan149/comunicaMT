@@ -5,7 +5,7 @@ function getVariableValue(name) {
   }
   return variables[name];
 }
-const df_823_1 = new (require('@comunica/logger-void').LoggerVoid)();
+const df_811_1 = new (require('@comunica/logger-void').LoggerVoid)();
 const https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_init__5_0_0_components_ActorInit_jsonld_ActorInit_default_bus = new (require('@comunica/core').Bus)({
   'name': 'https://linkedsoftwaredependencies.org/bundles/npm/@comunica/bus-init/^5.0.0/components/ActorInit.jsonld#ActorInit_default_bus'
 });
@@ -33,14 +33,14 @@ const https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_query_ser
 const https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_query_source_dereference_link__5_0_0_components_ActorQuerySourceDereferenceLink_jsonld_ActorQuerySourceDereferenceLink_default_bus = new (require('@comunica/core').Bus)({
   'name': 'https://linkedsoftwaredependencies.org/bundles/npm/@comunica/bus-query-source-dereference-link/^5.0.0/components/ActorQuerySourceDereferenceLink.jsonld#ActorQuerySourceDereferenceLink_default_bus'
 });
-const https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_query_source_identify_hypermedia__5_0_0_components_ActorQuerySourceIdentifyHypermedia_jsonld_ActorQuerySourceIdentifyHypermedia_default_bus = new (require('@comunica/core').Bus)({
-  'name': 'https://linkedsoftwaredependencies.org/bundles/npm/@comunica/bus-query-source-identify-hypermedia/^5.0.0/components/ActorQuerySourceIdentifyHypermedia.jsonld#ActorQuerySourceIdentifyHypermedia_default_bus'
-});
 const https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_dereference__5_0_0_components_ActorDereference_jsonld_ActorDereference_default_bus = new (require('@comunica/core').Bus)({
   'name': 'https://linkedsoftwaredependencies.org/bundles/npm/@comunica/bus-dereference/^5.0.0/components/ActorDereference.jsonld#ActorDereference_default_bus'
 });
 const https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_dereference_rdf__5_0_0_components_ActorDereferenceRdf_jsonld_ActorDereferenceRdf_default_bus = new (require('@comunica/core').Bus)({
   'name': 'https://linkedsoftwaredependencies.org/bundles/npm/@comunica/bus-dereference-rdf/^5.0.0/components/ActorDereferenceRdf.jsonld#ActorDereferenceRdf_default_bus'
+});
+const https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_query_source_identify_hypermedia__5_0_0_components_ActorQuerySourceIdentifyHypermedia_jsonld_ActorQuerySourceIdentifyHypermedia_default_bus = new (require('@comunica/core').Bus)({
+  'name': 'https://linkedsoftwaredependencies.org/bundles/npm/@comunica/bus-query-source-identify-hypermedia/^5.0.0/components/ActorQuerySourceIdentifyHypermedia.jsonld#ActorQuerySourceIdentifyHypermedia_default_bus'
 });
 const https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_rdf_join_entries_sort__5_0_0_components_ActorRdfJoinEntriesSort_jsonld_ActorRdfJoinEntriesSort_default_bus = new (require('@comunica/core').Bus)({
   'name': 'https://linkedsoftwaredependencies.org/bundles/npm/@comunica/bus-rdf-join-entries-sort/^5.0.0/components/ActorRdfJoinEntriesSort.jsonld#ActorRdfJoinEntriesSort_default_bus'
@@ -96,11 +96,11 @@ const https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_http__5_0
 const https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_query_operation__5_0_0_components_ActorQueryOperation_jsonld_ActorQueryOperation_default_bus = new (require('@comunica/bus-query-operation').BusQueryOperation)({
   'name': 'https://linkedsoftwaredependencies.org/bundles/npm/@comunica/bus-query-operation/^5.0.0/components/ActorQueryOperation.jsonld#ActorQueryOperation_default_bus'
 });
-const https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_query_process__5_0_0_components_ActorQueryProcess_jsonld_ActorQueryProcess_default_bus = new (require('@comunica/core').Bus)({
-  'name': 'https://linkedsoftwaredependencies.org/bundles/npm/@comunica/bus-query-process/^5.0.0/components/ActorQueryProcess.jsonld#ActorQueryProcess_default_bus'
-});
 const https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_query_source_identify__5_0_0_components_ActorQuerySourceIdentify_jsonld_ActorQuerySourceIdentify_default_bus = new (require('@comunica/core').Bus)({
   'name': 'https://linkedsoftwaredependencies.org/bundles/npm/@comunica/bus-query-source-identify/^5.0.0/components/ActorQuerySourceIdentify.jsonld#ActorQuerySourceIdentify_default_bus'
+});
+const https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_query_process__5_0_0_components_ActorQueryProcess_jsonld_ActorQueryProcess_default_bus = new (require('@comunica/core').Bus)({
+  'name': 'https://linkedsoftwaredependencies.org/bundles/npm/@comunica/bus-query-process/^5.0.0/components/ActorQueryProcess.jsonld#ActorQueryProcess_default_bus'
 });
 const https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_rdf_join__5_0_0_components_ActorRdfJoin_jsonld_ActorRdfJoin_default_bus = new (require('@comunica/core').Bus)({
   'name': 'https://linkedsoftwaredependencies.org/bundles/npm/@comunica/bus-rdf-join/^5.0.0/components/ActorRdfJoin.jsonld#ActorRdfJoin_default_bus'
@@ -121,7 +121,7 @@ const urn_comunica_default_context_preprocess_actors_convert_shortcuts = new (re
   'busFailMessage': 'Context preprocessing failed'
 });
 const urn_comunica_default_context_preprocess_actors_set_defaults = new (require('@comunica/actor-context-preprocess-set-defaults').ActorContextPreprocessSetDefaults)({
-  'logger': df_823_1,
+  'logger': df_811_1,
   'name': 'urn:comunica:default:context-preprocess/actors#set-defaults',
   'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_context_preprocess__5_0_0_components_ActorContextPreprocess_jsonld_ActorContextPreprocess_default_bus,
   'busFailMessage': 'Context preprocessing failed'
@@ -271,13 +271,6 @@ const urn_comunica_default_query_source_dereference_link_mediators_main = new (r
   'name': 'urn:comunica:default:query-source-dereference-link/mediators#main',
   'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_query_source_dereference_link__5_0_0_components_ActorQuerySourceDereferenceLink_jsonld_ActorQuerySourceDereferenceLink_default_bus
 });
-const urn_comunica_default_query_source_identify_hypermedia_mediators_main = new (require('@comunica/mediator-number').MediatorNumber)({
-  'field': 'filterFactor',
-  'type': 'max',
-  'ignoreFailures': true,
-  'name': 'urn:comunica:default:query-source-identify-hypermedia/mediators#main',
-  'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_query_source_identify_hypermedia__5_0_0_components_ActorQuerySourceIdentifyHypermedia_jsonld_ActorQuerySourceIdentifyHypermedia_default_bus
-});
 const urn_comunica_default_dereference_actors_fallback = new (require('@comunica/actor-dereference-fallback').ActorDereferenceFallback)({
   'name': 'urn:comunica:default:dereference/actors#fallback',
   'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_dereference__5_0_0_components_ActorDereference_jsonld_ActorDereference_default_bus,
@@ -290,6 +283,13 @@ const urn_comunica_default_dereference_mediators_main = new (require('@comunica/
 const urn_comunica_default_dereference_rdf_mediators_main = new (require('@comunica/mediator-race').MediatorRace)({
   'name': 'urn:comunica:default:dereference-rdf/mediators#main',
   'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_dereference_rdf__5_0_0_components_ActorDereferenceRdf_jsonld_ActorDereferenceRdf_default_bus
+});
+const urn_comunica_default_query_source_identify_hypermedia_mediators_main = new (require('@comunica/mediator-number').MediatorNumber)({
+  'field': 'filterFactor',
+  'type': 'max',
+  'ignoreFailures': true,
+  'name': 'urn:comunica:default:query-source-identify-hypermedia/mediators#main',
+  'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_query_source_identify_hypermedia__5_0_0_components_ActorQuerySourceIdentifyHypermedia_jsonld_ActorQuerySourceIdentifyHypermedia_default_bus
 });
 const urn_comunica_default_rdf_join_entries_sort_actors_cardinality = new (require('@comunica/actor-rdf-join-entries-sort-cardinality').ActorRdfJoinEntriesSortCardinality)({
   'name': 'urn:comunica:default:rdf-join-entries-sort/actors#cardinality',
@@ -617,13 +617,13 @@ const urn_comunica_default_function_factory_actors_term_function_ceil = new (req
   'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_function_factory__5_0_0_components_ActorFunctionFactory_jsonld_ActorFunctionFactory_default_bus,
   'busFailMessage': 'Creation of function evaluator failed: no configured actor was able to evaluate function ${action.functionName}'
 });
-const urn_comunica_default_function_factory_actors_term_function_datatype = new (require('@comunica/actor-function-factory-term-datatype').ActorFunctionFactoryTermDatatype)({
-  'name': 'urn:comunica:default:function-factory/actors#term-function-datatype',
+const urn_comunica_default_function_factory_actors_term_function_contains = new (require('@comunica/actor-function-factory-term-contains').ActorFunctionFactoryTermContains)({
+  'name': 'urn:comunica:default:function-factory/actors#term-function-contains',
   'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_function_factory__5_0_0_components_ActorFunctionFactory_jsonld_ActorFunctionFactory_default_bus,
   'busFailMessage': 'Creation of function evaluator failed: no configured actor was able to evaluate function ${action.functionName}'
 });
-const urn_comunica_default_function_factory_actors_term_function_contains = new (require('@comunica/actor-function-factory-term-contains').ActorFunctionFactoryTermContains)({
-  'name': 'urn:comunica:default:function-factory/actors#term-function-contains',
+const urn_comunica_default_function_factory_actors_term_function_datatype = new (require('@comunica/actor-function-factory-term-datatype').ActorFunctionFactoryTermDatatype)({
+  'name': 'urn:comunica:default:function-factory/actors#term-function-datatype',
   'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_function_factory__5_0_0_components_ActorFunctionFactory_jsonld_ActorFunctionFactory_default_bus,
   'busFailMessage': 'Creation of function evaluator failed: no configured actor was able to evaluate function ${action.functionName}'
 });
@@ -997,13 +997,13 @@ const urn_comunica_default_query_operation_mediators_main = new (require('@comun
   'name': 'urn:comunica:default:query-operation/mediators#main',
   'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_query_operation__5_0_0_components_ActorQueryOperation_jsonld_ActorQueryOperation_default_bus
 });
-const urn_comunica_default_query_process_mediators_main = new (require('@comunica/mediator-race').MediatorRace)({
-  'name': 'urn:comunica:default:query-process/mediators#main',
-  'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_query_process__5_0_0_components_ActorQueryProcess_jsonld_ActorQueryProcess_default_bus
-});
 const urn_comunica_default_query_source_identify_mediators_main = new (require('@comunica/mediator-race').MediatorRace)({
   'name': 'urn:comunica:default:query-source-identify/mediators#main',
   'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_query_source_identify__5_0_0_components_ActorQuerySourceIdentify_jsonld_ActorQuerySourceIdentify_default_bus
+});
+const urn_comunica_default_query_process_mediators_main = new (require('@comunica/mediator-race').MediatorRace)({
+  'name': 'urn:comunica:default:query-process/mediators#main',
+  'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_query_process__5_0_0_components_ActorQueryProcess_jsonld_ActorQueryProcess_default_bus
 });
 const urn_comunica_default_rdf_join_mediators_main = new (require('@comunica/mediator-join-coefficients-fixed').MediatorJoinCoefficientsFixed)({
   'cpuWeight': 10,
@@ -1668,16 +1668,6 @@ const urn_comunica_default_query_operation_actors_update_delete_insert = new (re
   'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_query_operation__5_0_0_components_ActorQueryOperation_jsonld_ActorQueryOperation_default_bus,
   'busFailMessage': 'Query operation processing failed: none of the configured actors were able to handle the operation type ${action.operation.type}'
 });
-const urn_comunica_default_query_process_actors_sequential = new (require('@comunica/actor-query-process-sequential-recursive').ActorQueryProcessSequentialRecursive)({
-  'mediatorContextPreprocess': urn_comunica_default_context_preprocess_mediators_main,
-  'mediatorQueryParse': urn_comunica_default_query_parse_mediators_main,
-  'mediatorOptimizeQueryOperation': urn_comunica_default_optimize_query_operation_mediators_main,
-  'mediatorQueryOperation': urn_comunica_default_query_operation_mediators_main,
-  'mediatorMergeBindingsContext': urn_comunica_default_merge_bindings_context_mediators_main,
-  'name': 'urn:comunica:default:query-process/actors#sequential',
-  'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_query_process__5_0_0_components_ActorQueryProcess_jsonld_ActorQueryProcess_default_bus,
-  'busFailMessage': 'Query processing failed: none of the configured actor were process to the query "${action.query}"'
-});
 const urn_comunica_default_query_source_identify_actors_hypermedia = new (require('@comunica/actor-query-source-identify-hypermedia').ActorQuerySourceIdentifyHypermedia)({
   'cacheSize': 100,
   'maxIterators': 64,
@@ -1714,6 +1704,16 @@ const urn_comunica_default_term_comparator_factory_actors_expression_evaluator =
   'name': 'urn:comunica:default:term-comparator-factory/actors#expression-evaluator',
   'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_term_comparator_factory__5_0_0_components_ActorTermComparatorFactory_jsonld_ActorTermComparatorFactory_default_bus,
   'busFailMessage': 'Creation of term comparator failed'
+});
+const urn_comunica_default_query_process_actors_sequential = new (require('@comunica/actor-query-process-sequential-recursive').ActorQueryProcessSequentialRecursive)({
+  'mediatorContextPreprocess': urn_comunica_default_context_preprocess_mediators_main,
+  'mediatorQueryParse': urn_comunica_default_query_parse_mediators_main,
+  'mediatorOptimizeQueryOperation': urn_comunica_default_optimize_query_operation_mediators_main,
+  'mediatorQueryOperation': urn_comunica_default_query_operation_mediators_main,
+  'mediatorMergeBindingsContext': urn_comunica_default_merge_bindings_context_mediators_main,
+  'name': 'urn:comunica:default:query-process/actors#sequential',
+  'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_query_process__5_0_0_components_ActorQueryProcess_jsonld_ActorQueryProcess_default_bus,
+  'busFailMessage': 'Query processing failed: none of the configured actor were process to the query "${action.query}"'
 });
 const urn_comunica_default_query_source_dereference_link_actors_force_sparql = new (require('@comunica/actor-query-source-dereference-link-force-sparql').ActorQuerySourceDereferenceLinkForceSparql)({
   'mediatorMetadataAccumulate': urn_comunica_default_rdf_metadata_accumulate_mediators_main,
@@ -1998,10 +1998,10 @@ const urn_comunica_default_Runner = (https___linkedsoftwaredependencies_org_bund
   urn_comunica_default_query_serialize_actors_sparql,
   urn_comunica_default_query_source_dereference_link_actors_force_sparql,
   urn_comunica_default_query_source_dereference_link_actors_dereference,
-  urn_comunica_default_query_source_identify_hypermedia_actors_passage,
   urn_comunica_default_dereference_actors_http,
   urn_comunica_default_dereference_actors_fallback,
   urn_comunica_default_dereference_rdf_actors_parse,
+  urn_comunica_default_query_source_identify_hypermedia_actors_passage,
   urn_comunica_default_rdf_join_entries_sort_actors_cardinality,
   urn_comunica_default_rdf_join_entries_sort_actors_selectivity,
   urn_comunica_default_rdf_join_selectivity_actors_variable_counting,
@@ -2063,8 +2063,8 @@ const urn_comunica_default_Runner = (https___linkedsoftwaredependencies_org_bund
   urn_comunica_default_function_factory_actors_term_function_abs,
   urn_comunica_default_function_factory_actors_term_function_addition,
   urn_comunica_default_function_factory_actors_term_function_ceil,
-  urn_comunica_default_function_factory_actors_term_function_datatype,
   urn_comunica_default_function_factory_actors_term_function_contains,
+  urn_comunica_default_function_factory_actors_term_function_datatype,
   urn_comunica_default_function_factory_actors_term_function_day,
   urn_comunica_default_function_factory_actors_term_function_division,
   urn_comunica_default_function_factory_actors_term_function_encode_for_uri,
@@ -2178,14 +2178,13 @@ const urn_comunica_default_Runner = (https___linkedsoftwaredependencies_org_bund
   urn_comunica_default_query_operation_actors_update_delete_insert,
   urn_comunica_default_query_operation_actors_update_drop,
   urn_comunica_default_query_operation_actors_update_load,
-  urn_comunica_default_query_process_actors_sequential,
+  urn_comunica_default_query_source_identify_actors_hypermedia,
+  urn_comunica_default_query_source_identify_actors_rdfjs,
+  urn_comunica_default_query_source_identify_actors_serialized,
   urn_comunica_default_query_process_actors_explain_parsed,
   urn_comunica_default_query_process_actors_explain_logical,
   urn_comunica_default_query_process_actors_explain_query,
   urn_comunica_default_query_process_actors_explain_physical,
-  urn_comunica_default_query_source_identify_actors_hypermedia,
-  urn_comunica_default_query_source_identify_actors_rdfjs,
-  urn_comunica_default_query_source_identify_actors_serialized,
   urn_comunica_default_rdf_join_actors_inner_none,
   urn_comunica_default_rdf_join_actors_inner_single,
   urn_comunica_default_rdf_join_actors_inner_multi_empty,
@@ -2205,7 +2204,8 @@ const urn_comunica_default_Runner = (https___linkedsoftwaredependencies_org_bund
   urn_comunica_default_rdf_join_actors_optional_hash_undef_nonblocking,
   urn_comunica_default_rdf_join_actors_optional_hash_undef_blocking,
   urn_comunica_default_rdf_join_actors_optional_nested_loop,
-  urn_comunica_default_term_comparator_factory_actors_expression_evaluator
+  urn_comunica_default_term_comparator_factory_actors_expression_evaluator,
+  urn_comunica_default_query_process_actors_sequential
 ]);
 return urn_comunica_default_init_actors_query;
 }

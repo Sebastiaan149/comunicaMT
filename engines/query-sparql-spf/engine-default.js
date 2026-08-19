@@ -804,13 +804,13 @@ const urn_comunica_default_function_factory_actors_term_function_sha256 = new (r
   'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_function_factory__5_0_0_components_ActorFunctionFactory_jsonld_ActorFunctionFactory_default_bus,
   'busFailMessage': 'Creation of function evaluator failed: no configured actor was able to evaluate function ${action.functionName}'
 });
-const urn_comunica_default_function_factory_actors_term_function_sha512 = new (require('@comunica/actor-function-factory-term-sha512').ActorFunctionFactoryTermSha512)({
-  'name': 'urn:comunica:default:function-factory/actors#term-function-sha512',
+const urn_comunica_default_function_factory_actors_term_function_sha384 = new (require('@comunica/actor-function-factory-term-sha384').ActorFunctionFactoryTermSha384)({
+  'name': 'urn:comunica:default:function-factory/actors#term-function-sha384',
   'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_function_factory__5_0_0_components_ActorFunctionFactory_jsonld_ActorFunctionFactory_default_bus,
   'busFailMessage': 'Creation of function evaluator failed: no configured actor was able to evaluate function ${action.functionName}'
 });
-const urn_comunica_default_function_factory_actors_term_function_sha384 = new (require('@comunica/actor-function-factory-term-sha384').ActorFunctionFactoryTermSha384)({
-  'name': 'urn:comunica:default:function-factory/actors#term-function-sha384',
+const urn_comunica_default_function_factory_actors_term_function_sha512 = new (require('@comunica/actor-function-factory-term-sha512').ActorFunctionFactoryTermSha512)({
+  'name': 'urn:comunica:default:function-factory/actors#term-function-sha512',
   'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_function_factory__5_0_0_components_ActorFunctionFactory_jsonld_ActorFunctionFactory_default_bus,
   'busFailMessage': 'Creation of function evaluator failed: no configured actor was able to evaluate function ${action.functionName}'
 });
@@ -859,13 +859,13 @@ const urn_comunica_default_function_factory_actors_term_function_str_uuid = new 
   'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_function_factory__5_0_0_components_ActorFunctionFactory_jsonld_ActorFunctionFactory_default_bus,
   'busFailMessage': 'Creation of function evaluator failed: no configured actor was able to evaluate function ${action.functionName}'
 });
-const urn_comunica_default_function_factory_actors_term_function_sub_str = new (require('@comunica/actor-function-factory-term-sub-str').ActorFunctionFactoryTermSubStr)({
-  'name': 'urn:comunica:default:function-factory/actors#term-function-sub-str',
+const urn_comunica_default_function_factory_actors_term_function_str = new (require('@comunica/actor-function-factory-term-str').ActorFunctionFactoryTermStr)({
+  'name': 'urn:comunica:default:function-factory/actors#term-function-str',
   'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_function_factory__5_0_0_components_ActorFunctionFactory_jsonld_ActorFunctionFactory_default_bus,
   'busFailMessage': 'Creation of function evaluator failed: no configured actor was able to evaluate function ${action.functionName}'
 });
-const urn_comunica_default_function_factory_actors_term_function_str = new (require('@comunica/actor-function-factory-term-str').ActorFunctionFactoryTermStr)({
-  'name': 'urn:comunica:default:function-factory/actors#term-function-str',
+const urn_comunica_default_function_factory_actors_term_function_sub_str = new (require('@comunica/actor-function-factory-term-sub-str').ActorFunctionFactoryTermSubStr)({
+  'name': 'urn:comunica:default:function-factory/actors#term-function-sub-str',
   'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_function_factory__5_0_0_components_ActorFunctionFactory_jsonld_ActorFunctionFactory_default_bus,
   'busFailMessage': 'Creation of function evaluator failed: no configured actor was able to evaluate function ${action.functionName}'
 });
@@ -1811,6 +1811,12 @@ const urn_comunica_default_query_process_actors_explain_parsed = new (require('@
   'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_query_process__5_0_0_components_ActorQueryProcess_jsonld_ActorQueryProcess_default_bus,
   'busFailMessage': 'Query processing failed: none of the configured actor were process to the query "${action.query}"'
 });
+const urn_comunica_default_query_process_actors_explain_logical = new (require('@comunica/actor-query-process-explain-logical').ActorQueryProcessExplainLogical)({
+  'queryProcessor': urn_comunica_default_query_process_actors_sequential,
+  'name': 'urn:comunica:default:query-process/actors#explain-logical',
+  'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_query_process__5_0_0_components_ActorQueryProcess_jsonld_ActorQueryProcess_default_bus,
+  'busFailMessage': 'Query processing failed: none of the configured actor were process to the query "${action.query}"'
+});
 const urn_comunica_default_query_process_actors_explain_query = new (require('@comunica/actor-query-process-explain-query').ActorQueryProcessExplainQuery)({
   'queryProcessor': urn_comunica_default_query_process_actors_sequential,
   'mediatorQuerySerialize': urn_comunica_default_query_serialize_mediators_main,
@@ -1821,12 +1827,6 @@ const urn_comunica_default_query_process_actors_explain_query = new (require('@c
 const urn_comunica_default_query_process_actors_explain_physical = new (require('@comunica/actor-query-process-explain-physical').ActorQueryProcessExplainPhysical)({
   'queryProcessor': urn_comunica_default_query_process_actors_sequential,
   'name': 'urn:comunica:default:query-process/actors#explain-physical',
-  'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_query_process__5_0_0_components_ActorQueryProcess_jsonld_ActorQueryProcess_default_bus,
-  'busFailMessage': 'Query processing failed: none of the configured actor were process to the query "${action.query}"'
-});
-const urn_comunica_default_query_process_actors_explain_logical = new (require('@comunica/actor-query-process-explain-logical').ActorQueryProcessExplainLogical)({
-  'queryProcessor': urn_comunica_default_query_process_actors_sequential,
-  'name': 'urn:comunica:default:query-process/actors#explain-logical',
   'bus': https___linkedsoftwaredependencies_org_bundles_npm__comunica_bus_query_process__5_0_0_components_ActorQueryProcess_jsonld_ActorQueryProcess_default_bus,
   'busFailMessage': 'Query processing failed: none of the configured actor were process to the query "${action.query}"'
 });
@@ -2151,8 +2151,8 @@ const urn_comunica_default_Runner = (https___linkedsoftwaredependencies_org_bund
   urn_comunica_default_function_factory_actors_term_function_seconds,
   urn_comunica_default_function_factory_actors_term_function_sha1,
   urn_comunica_default_function_factory_actors_term_function_sha256,
-  urn_comunica_default_function_factory_actors_term_function_sha512,
   urn_comunica_default_function_factory_actors_term_function_sha384,
+  urn_comunica_default_function_factory_actors_term_function_sha512,
   urn_comunica_default_function_factory_actors_term_function_str_after,
   urn_comunica_default_function_factory_actors_term_function_str_before,
   urn_comunica_default_function_factory_actors_term_function_str_dt,
@@ -2162,8 +2162,8 @@ const urn_comunica_default_Runner = (https___linkedsoftwaredependencies_org_bund
   urn_comunica_default_function_factory_actors_term_function_str_len,
   urn_comunica_default_function_factory_actors_term_function_str_starts,
   urn_comunica_default_function_factory_actors_term_function_str_uuid,
-  urn_comunica_default_function_factory_actors_term_function_sub_str,
   urn_comunica_default_function_factory_actors_term_function_str,
+  urn_comunica_default_function_factory_actors_term_function_sub_str,
   urn_comunica_default_function_factory_actors_term_function_subject,
   urn_comunica_default_function_factory_actors_term_function_subtraction,
   urn_comunica_default_function_factory_actors_term_function_timezone,
@@ -2202,8 +2202,8 @@ const urn_comunica_default_Runner = (https___linkedsoftwaredependencies_org_bund
   urn_comunica_default_query_operation_actors_group,
   urn_comunica_default_query_operation_actors_join,
   urn_comunica_default_query_operation_actors_leftjoin,
-  urn_comunica_default_query_operation_actors_nodes,
   urn_comunica_default_query_operation_actors_minus,
+  urn_comunica_default_query_operation_actors_nodes,
   urn_comunica_default_query_operation_actors_nop,
   urn_comunica_default_query_operation_actors_orderby,
   urn_comunica_default_query_operation_actors_project,
@@ -2223,14 +2223,14 @@ const urn_comunica_default_Runner = (https___linkedsoftwaredependencies_org_bund
   urn_comunica_default_query_operation_actors_update_clear,
   urn_comunica_default_query_operation_actors_update_composite,
   urn_comunica_default_query_operation_actors_update_create,
-  urn_comunica_default_query_operation_actors_update_drop,
   urn_comunica_default_query_operation_actors_update_delete_insert,
+  urn_comunica_default_query_operation_actors_update_drop,
   urn_comunica_default_query_operation_actors_update_load,
   urn_comunica_default_query_process_actors_sequential,
   urn_comunica_default_query_process_actors_explain_parsed,
+  urn_comunica_default_query_process_actors_explain_logical,
   urn_comunica_default_query_process_actors_explain_query,
   urn_comunica_default_query_process_actors_explain_physical,
-  urn_comunica_default_query_process_actors_explain_logical,
   urn_comunica_default_query_source_identify_actors_hypermedia,
   urn_comunica_default_query_source_identify_actors_rdfjs,
   urn_comunica_default_query_source_identify_actors_serialized,

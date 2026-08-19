@@ -10,7 +10,8 @@
     "access": "public"
   },
   "bin": {
-    "comunica-passage": "bin/query.js"
+    "comunica-passage": "bin/query.js",
+    "comunica-passage-http": "bin/http.js"
   },
   "files": [
     "bin/**/*.d.ts",
@@ -29,6 +30,7 @@
     "prepare": "comunica-compile-config config/config-default.json > engine-default.js"
   },
   "dependencies": {
+    "@comunica/actor-init-query": "^5.1.3",
     "@comunica/actor-query-process-sequential-recursive": "^5.1.3",
     "@comunica/actor-query-source-identify-hypermedia-passage": "^5.1.3",
     "@comunica/actor-query-source-identify-hypermedia-raw": "^5.1.3",

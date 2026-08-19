@@ -280,6 +280,7 @@ export class QuerySourceSmartKg implements IQuerySource {
   private readonly defaultContext: IActionContext;
   private readonly cacheFolder: string;
   private readonly hdtCache = new HdtDocumentCache();
+  private hdtEvaluation = Promise.resolve();
   private readonly originalSourceUrl: string;
   private readonly metadataUrl: string;
   private readonly partitionsBaseUrl: string;
@@ -1290,28 +1291,37 @@ export class QuerySourceSmartKg implements IQuerySource {
     patterns: Algebra.Pattern[],
     inputBindings?: RDF.Bindings[],
   ): Promise<RDF.Bindings[]> {
-    const document = await this.hdtCache.getDocument(partitionPath);
-    if (patterns.length === 0) {
-      return [ await this.emptyBinding() ];
-    }
-    if (patterns.length === 1 && !inputBindings) {
-      return this.collectCachedHdtBindings(partitionPath, document, patterns[0]);
-    }
-
-    // This follows the same cardinality-first, bounded pipeline principles as
-    // Comunica's TPF/brTPF bind joins. Only the smallest HDT pattern is
-    // materialized. Every later pattern is read page-by-page and immediately
-    // hash-joined, avoiding a second full-pattern array and repeated full-array
-    // deduplication at each star step.
-    const orderedPatterns = await this.orderPartitionPatternsByCardinality(document, patterns, inputBindings);
-    let results = inputBindings ?? [ await this.emptyBinding() ];
-    for (const pattern of orderedPatterns) {
-      results = await this.joinBindingsWithHdtPattern(results, document, pattern);
-      if (results.length === 0) {
-        return [];
+    const previous = this.hdtEvaluation;
+    let release!: () => void;
+    this.hdtEvaluation = new Promise<void>(resolve => release = resolve);
+    await previous;
+    try {
+      const document = await this.hdtCache.getDocument(partitionPath);
+      if (patterns.length === 0) {
+        return [ await this.emptyBinding() ];
       }
+      if (patterns.length === 1 && !inputBindings) {
+        const bindings = await this.collectCachedHdtBindings(partitionPath, document, patterns[0]);
+        return bindings;
+      }
+
+      // This follows the same cardinality-first, bounded pipeline principles as
+      // Comunica's TPF/brTPF bind joins. Only the smallest HDT pattern is
+      // materialized. Every later pattern is read page-by-page and immediately
+      // hash-joined, avoiding a second full-pattern array and repeated full-array
+      // deduplication at each star step.
+      const orderedPatterns = await this.orderPartitionPatternsByCardinality(document, patterns, inputBindings);
+      let results = inputBindings ?? [ await this.emptyBinding() ];
+      for (const pattern of orderedPatterns) {
+        results = await this.joinBindingsWithHdtPattern(results, document, pattern);
+        if (results.length === 0) {
+          return [];
+        }
+      }
+      return results;
+    } finally {
+      release();
     }
-    return results;
   }
 
   private async orderPartitionPatternsByCardinality(

@@ -5,10 +5,6 @@ const config: Config.InitialOptions = {
   coveragePathIgnorePatterns: [
     '/test/',
     '/node_modules/',
-    'actor-query-operation-bgp-smartkg',
-    'actor-query-operation-bgp-wisekg',
-    'actor-query-source-identify-hypermedia-smartkg',
-    'actor-query-source-identify-hypermedia-wisekg',
     'engine-default.js',
     'index.js',
   ],
